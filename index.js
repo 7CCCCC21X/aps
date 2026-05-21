@@ -177,22 +177,26 @@ function chunkText(text, max = 4000) {
   return chunks;
 }
 
-async function sendTelegram(chatId, text) {
+async function sendTelegram(chatId, text, extra = {}) {
   if (!BOT_TOKEN) {
     console.warn("[tg] TELEGRAM_BOT_TOKEN 未设置，跳过发送");
     return;
   }
-  for (const chunk of chunkText(text)) {
+  const chunks = chunkText(text);
+  for (let i = 0; i < chunks.length; i++) {
+    const body = {
+      chat_id: chatId,
+      text: chunks[i],
+      parse_mode: "HTML",
+      disable_web_page_preview: true,
+    };
+    // reply_markup 等附加项只挂在最后一块消息上
+    if (i === chunks.length - 1) Object.assign(body, extra);
     try {
       const res = await fetch(`${TG_API}/sendMessage`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          chat_id: chatId,
-          text: chunk,
-          parse_mode: "HTML",
-          disable_web_page_preview: true,
-        }),
+        body: JSON.stringify(body),
         signal: AbortSignal.timeout(15000),
       });
       if (!res.ok) {
@@ -201,6 +205,54 @@ async function sendTelegram(chatId, text) {
     } catch (e) {
       console.error("[tg] sendMessage 失败:", e.message);
     }
+  }
+}
+
+async function answerCallback(callbackId, text) {
+  if (!BOT_TOKEN) return;
+  try {
+    await fetch(`${TG_API}/answerCallbackQuery`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ callback_query_id: callbackId, text }),
+      signal: AbortSignal.timeout(15000),
+    });
+  } catch (e) {
+    console.error("[tg] answerCallbackQuery 失败:", e.message);
+  }
+}
+
+// 启动时注册命令菜单（Telegram 输入框旁的 “菜单” 按钮）
+async function registerCommands() {
+  if (!BOT_TOKEN) return;
+  const commands = [
+    { command: "menu", description: "打开功能菜单" },
+    { command: "now", description: "立即查询全部项目" },
+    { command: "top", description: "24H 涨跌排行" },
+    { command: "detail", description: "查看单个项目，如 /detail GAEA" },
+    { command: "pause", description: "暂停自动提醒" },
+    { command: "resume", description: "恢复自动提醒" },
+    { command: "status", description: "查看当前配置" },
+    { command: "set_interval", description: "设置查询间隔（秒）" },
+    { command: "set_poll", description: "设置本轮变化阈值（%）" },
+    { command: "set_day", description: "设置 24H 变化阈值（%）" },
+    { command: "id", description: "查看当前 chat_id" },
+    { command: "help", description: "查看命令列表" },
+  ];
+  try {
+    const res = await fetch(`${TG_API}/setMyCommands`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ commands }),
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!res.ok) {
+      console.error(`[tg] setMyCommands ${res.status}`, await res.text());
+    } else {
+      console.log("[tg] 命令菜单已注册");
+    }
+  } catch (e) {
+    console.error("[tg] setMyCommands 失败:", e.message);
   }
 }
 
@@ -267,9 +319,26 @@ function isAuthorized(chatId) {
   return !CHAT_ID || String(chatId) === String(CHAT_ID);
 }
 
+// 点击式菜单（inline keyboard）。callback_data 直接复用命令名
+const MENU_KEYBOARD = {
+  inline_keyboard: [
+    [
+      { text: "📊 全部项目", callback_data: "now" },
+      { text: "🏆 涨跌排行", callback_data: "top" },
+    ],
+    [{ text: "⚙️ 当前配置", callback_data: "status" }],
+    [
+      { text: "⏸ 暂停提醒", callback_data: "pause" },
+      { text: "▶️ 恢复提醒", callback_data: "resume" },
+    ],
+    [{ text: "❓ 帮助", callback_data: "help" }],
+  ],
+};
+
 const HELP_TEXT = [
   "🤖 <b>Aspecta 价格追踪机器人</b>",
   "",
+  "/menu - 打开功能菜单",
   "/now - 立即查询全部项目",
   "/top - 24H 涨跌排行",
   "/detail &lt;项目&gt; - 查看单个项目，如 /detail GAEA",
@@ -362,6 +431,11 @@ async function handleCommand(chatId, cmd, args) {
     case "/help":
       await sendTelegram(chatId, HELP_TEXT);
       break;
+    case "/menu":
+      await sendTelegram(chatId, "📋 <b>功能菜单</b>\n点击下方按钮操作：", {
+        reply_markup: MENU_KEYBOARD,
+      });
+      break;
     case "/status":
       await sendTelegram(chatId, statusText());
       break;
@@ -417,7 +491,29 @@ async function handleCommand(chatId, cmd, args) {
   }
 }
 
+async function handleCallback(cq) {
+  const chatId = cq.message && cq.message.chat ? cq.message.chat.id : null;
+  await answerCallback(cq.id); // 先确认，停止按钮转圈
+  if (chatId == null) return;
+  if (!isAuthorized(chatId)) {
+    await sendTelegram(chatId, "⛔ 未授权访问");
+    return;
+  }
+  const data = String(cq.data || "");
+  if (!data) return;
+  try {
+    await handleCommand(chatId, "/" + data, []);
+  } catch (e) {
+    console.error("[tg] 回调处理出错:", e.message);
+    await sendTelegram(chatId, `❌ 出错了：${esc(e.message)}`);
+  }
+}
+
 async function handleUpdate(upd) {
+  if (upd.callback_query) {
+    await handleCallback(upd.callback_query);
+    return;
+  }
   const msg = upd.message || upd.edited_message;
   if (!msg || !msg.text) return;
   const chatId = msg.chat.id;
@@ -503,11 +599,12 @@ function main() {
   if (!CHAT_ID) console.warn("[boot] 警告：未设置 TELEGRAM_CHAT_ID，自动提醒不会发送");
 
   startServer();
+  registerCommands();
   telegramPollLoop();
   pollLoop();
 
   if (BOT_TOKEN && CHAT_ID) {
-    sendTelegram(CHAT_ID, "🤖 Aspecta 价格追踪已启动，发送 /help 查看命令");
+    sendTelegram(CHAT_ID, "🤖 Aspecta 价格追踪已启动，发送 /menu 打开菜单");
   }
 }
 
