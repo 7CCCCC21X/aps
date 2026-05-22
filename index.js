@@ -374,11 +374,11 @@ function batchedMessage(triggered) {
       t.item.change24h != null ? Math.abs(t.item.change24h) : 0,
     );
   triggered.sort((a, b) => sev(b) - sev(a));
-  const header = `⚠️ <b>Aspecta 异动 (${triggered.length})</b>`;
   const blocks = triggered.map((t) =>
     alertBlock(t.item, t.pollChange, t.reasons),
   );
-  return [header, ...blocks].join("\n\n");
+  if (blocks.length === 1) return blocks[0]; // 单个项目无需头部
+  return [`⚠️ <b>异动 ×${blocks.length}</b>`, ...blocks].join("\n\n");
 }
 
 // 启动时的“当前异动”快照
