@@ -50,15 +50,33 @@ const settings = {
   pollAlertPercent: floatEnv("POLL_ALERT_PERCENT", 1),
   dayAlertPercent: floatEnv("DAY_ALERT_PERCENT", 5),
   cooldownMin: intEnv("ALERT_COOLDOWN_MIN", 30),
+  // 本轮变化的回看窗口（秒）。0 = 对比上一次轮询；>0 = 对比约 N 秒前的价格
+  pollLookbackSec: intEnv("POLL_LOOKBACK_SEC", 0, 0),
   paused: false,
 };
 
 const TG_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
 
 // 运行时状态
-const lastPrices = new Map(); // project -> 上一轮价格
+const priceHistory = new Map(); // project -> [{ t, price }]（按时间升序）
 const lastPollChange = new Map(); // project -> 上一轮变化%
 const alertCooldown = new Map(); // `${project}:${type}` -> 时间戳
+const subscriptions = new Map(); // key -> { chatId, threadId }；提醒会发到这些目标
+
+function subKey(chatId, threadId) {
+  return `${chatId}:${threadId == null ? "general" : threadId}`;
+}
+function addSubscription(chatId, threadId) {
+  const tid = threadId == null ? null : Number(threadId);
+  subscriptions.set(subKey(chatId, tid), { chatId, threadId: tid });
+}
+function removeSubscription(chatId, threadId) {
+  return subscriptions.delete(subKey(chatId, threadId == null ? null : Number(threadId)));
+}
+// 用环境变量里的 CHAT_ID/TOPIC_ID 作为持久的默认订阅（重启后仍在）
+function seedSubscriptions() {
+  if (CHAT_ID) addSubscription(CHAT_ID, TOPIC_ID);
+}
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -155,11 +173,48 @@ function parseSnapshot(raw) {
 }
 
 // ── 4. 本轮变化对比 ─────────────────────────────────────────────
+// pollLookbackSec=0 时对比上一次轮询；>0 时对比约 N 秒前的价格，
+// 这样“慢涨累积”的异动也能被抓到，而不只是单个间隔内的突变。
 function getPollChange(project, currentPrice) {
-  const oldPrice = lastPrices.get(project);
-  lastPrices.set(project, currentPrice);
-  if (oldPrice == null || oldPrice === 0) return null;
-  return ((currentPrice - oldPrice) / oldPrice) * 100;
+  const now = Date.now();
+  let hist = priceHistory.get(project);
+  if (!hist) {
+    hist = [];
+    priceHistory.set(project, hist);
+  }
+
+  const lookbackMs = settings.pollLookbackSec * 1000;
+  let basePrice = null;
+  if (lookbackMs > 0) {
+    const cutoff = now - lookbackMs;
+    for (const e of hist) {
+      if (e.t <= cutoff) basePrice = e.price; // 取不晚于 cutoff 的最近一条
+      else break;
+    }
+  } else if (hist.length) {
+    basePrice = hist[hist.length - 1].price; // 对比上一次轮询
+  }
+
+  hist.push({ t: now, price: currentPrice });
+
+  // 修剪历史，保留窗口 + 10 分钟缓冲，避免无限增长
+  const keepMs = lookbackMs + 10 * 60 * 1000;
+  while (hist.length && hist[0].t < now - keepMs) hist.shift();
+
+  if (basePrice == null || basePrice === 0) return null;
+  return ((currentPrice - basePrice) / basePrice) * 100;
+}
+
+function fmtWindow(sec) {
+  if (sec % 3600 === 0) return `${sec / 3600}小时`;
+  if (sec % 60 === 0) return `${sec / 60}分钟`;
+  return `${sec}秒`;
+}
+
+function pollLabel() {
+  return settings.pollLookbackSec > 0
+    ? `近${fmtWindow(settings.pollLookbackSec)}变化`
+    : "本轮变化";
 }
 
 // ── 5. 冷却判断 ─────────────────────────────────────────────────
@@ -243,13 +298,18 @@ async function registerCommands() {
     { command: "now", description: "立即查询全部项目" },
     { command: "top", description: "24H 涨跌排行" },
     { command: "detail", description: "查看单个项目，如 /detail GAEA" },
+    { command: "subscribe", description: "把提醒订阅到当前话题" },
+    { command: "unsubscribe", description: "取消当前话题的订阅" },
+    { command: "subs", description: "查看所有订阅目标" },
     { command: "pause", description: "暂停自动提醒" },
     { command: "resume", description: "恢复自动提醒" },
     { command: "status", description: "查看当前配置" },
     { command: "set_interval", description: "设置查询间隔（秒）" },
     { command: "set_poll", description: "设置本轮变化阈值（%）" },
     { command: "set_day", description: "设置 24H 变化阈值（%）" },
-    { command: "id", description: "查看当前 chat_id" },
+    { command: "set_cooldown", description: "设置提醒冷却（分钟）" },
+    { command: "set_lookback", description: "设置本轮变化回看窗口（秒）" },
+    { command: "id", description: "查看当前 chat_id / topic_id" },
     { command: "help", description: "查看命令列表" },
   ];
   try {
@@ -274,16 +334,23 @@ function alertMessage(item, pollChange, reasons) {
     `⚠️ <b>Aspecta 价格提醒</b> (${reasons.join(" / ")})`,
     `<b>${esc(item.project)}</b>`,
     `最新价：$${fmtPrice(item.price)}`,
-    `本轮变化：${fmtPct(pollChange)}`,
+    `${pollLabel()}：${fmtPct(pollChange)}`,
     `1H变化：${fmtPct(item.change1h)}`,
     `24H变化：${fmtPct(item.change24h)}`,
   ].join("\n");
 }
 
+// 把消息发到所有订阅的目标（群/话题）
+async function broadcast(text, extra = {}) {
+  for (const sub of subscriptions.values()) {
+    await sendTelegram(sub.chatId, text, threadExtra(sub.threadId, { ...extra }));
+  }
+}
+
 // ── 定时轮询主循环 ──────────────────────────────────────────────
 async function runPollCycle() {
   if (settings.paused) return;
-  if (!CHAT_ID) return; // 没有目标 chat，无法推送提醒
+  if (subscriptions.size === 0) return; // 没有订阅目标，无法推送提醒
 
   const snapshot = await fetchSnapshot();
   for (const item of snapshot) {
@@ -309,11 +376,7 @@ async function runPollCycle() {
     }
 
     if (reasons.length) {
-      await sendTelegram(
-        CHAT_ID,
-        alertMessage(item, pollChange, reasons),
-        threadExtra(TOPIC_ID),
-      );
+      await broadcast(alertMessage(item, pollChange, reasons));
     }
   }
 }
@@ -345,6 +408,10 @@ const MENU_KEYBOARD = {
     ],
     [{ text: "⚙️ 当前配置", callback_data: "status" }],
     [
+      { text: "📌 订阅本话题", callback_data: "subscribe" },
+      { text: "🚫 取消订阅", callback_data: "unsubscribe" },
+    ],
+    [
       { text: "⏸ 暂停提醒", callback_data: "pause" },
       { text: "▶️ 恢复提醒", callback_data: "resume" },
     ],
@@ -359,11 +426,16 @@ const HELP_TEXT = [
   "/now - 立即查询全部项目",
   "/top - 24H 涨跌排行",
   "/detail &lt;项目&gt; - 查看单个项目，如 /detail GAEA",
+  "/subscribe - 把提醒订阅到当前话题",
+  "/unsubscribe - 取消当前话题的订阅",
+  "/subs - 查看所有订阅目标",
   "/pause - 暂停自动提醒",
   "/resume - 恢复自动提醒",
   "/set_interval &lt;秒&gt; - 设置查询间隔（最小 10）",
   "/set_poll &lt;百分比&gt; - 本轮变化提醒阈值",
   "/set_day &lt;百分比&gt; - 24H 变化提醒阈值",
+  "/set_cooldown &lt;分钟&gt; - 同项目同类型提醒冷却",
+  "/set_lookback &lt;秒&gt; - 本轮变化回看窗口（0=对比上一次轮询）",
   "/status - 查看当前配置",
   "/id - 查看当前 chat_id / topic_id",
 ].join("\n");
@@ -374,8 +446,10 @@ function statusText() {
     `自动提醒：${settings.paused ? "⏸ 已暂停" : "▶️ 运行中"}`,
     `查询间隔：${settings.pollIntervalSec}s`,
     `本轮阈值：${settings.pollAlertPercent}%`,
+    `本轮窗口：${settings.pollLookbackSec > 0 ? fmtWindow(settings.pollLookbackSec) : "上一次轮询"}`,
     `24H阈值：${settings.dayAlertPercent}%`,
     `冷却时间：${settings.cooldownMin}min`,
+    `订阅目标：${subscriptions.size}`,
     `项目数量：${PROJECTS.length}`,
   ].join("\n");
 }
@@ -441,7 +515,7 @@ async function cmdDetail(chatId, threadId, name) {
     [
       `📈 <b>${esc(it.project)}</b>`,
       `最新价：$${fmtPrice(it.price)}`,
-      `本轮变化：${poll != null ? fmtPct(poll) : "N/A"}`,
+      `${pollLabel()}：${poll != null ? fmtPct(poll) : "N/A"}`,
       `1H变化：${fmtPct(it.change1h)}`,
       `24H变化：${fmtPct(it.change24h)}`,
       `最高：$${fmtPrice(it.high)}`,
@@ -476,6 +550,38 @@ async function handleCommand(chatId, threadId, cmd, args) {
     case "/detail":
       await cmdDetail(chatId, threadId, args[0]);
       break;
+    case "/subscribe":
+      addSubscription(chatId, threadId);
+      await reply(
+        [
+          "✅ 已订阅本话题，之后的提醒会发送到这里",
+          `chat_id: <code>${chatId}</code>`,
+          threadId != null ? `topic_id: <code>${threadId}</code>` : "话题: General",
+        ].join("\n"),
+      );
+      break;
+    case "/unsubscribe":
+      if (removeSubscription(chatId, threadId)) {
+        await reply("🚫 已取消订阅本话题");
+      } else {
+        await reply("ℹ️ 本话题尚未订阅");
+      }
+      break;
+    case "/subs": {
+      if (subscriptions.size === 0) {
+        await reply("当前没有任何订阅，进入目标话题发送 /subscribe 即可");
+        break;
+      }
+      const lines = ["📌 <b>当前订阅目标</b>"];
+      for (const s of subscriptions.values()) {
+        lines.push(
+          `chat <code>${s.chatId}</code>` +
+            (s.threadId != null ? ` / topic <code>${s.threadId}</code>` : " / General"),
+        );
+      }
+      await reply(lines.join("\n"));
+      break;
+    }
     case "/pause":
       settings.paused = true;
       await reply("⏸ 已暂停自动提醒");
@@ -512,6 +618,30 @@ async function handleCommand(chatId, threadId, cmd, args) {
       }
       settings.dayAlertPercent = v;
       await reply(`✅ 24H 变化阈值已设为 ${v}%`);
+      break;
+    }
+    case "/set_cooldown": {
+      const v = parseInt(args[0], 10);
+      if (!Number.isFinite(v) || v < 0) {
+        await reply("❌ 请输入 ≥0 的分钟数，例如 /set_cooldown 5");
+        break;
+      }
+      settings.cooldownMin = v;
+      await reply(`✅ 提醒冷却已设为 ${v}min`);
+      break;
+    }
+    case "/set_lookback": {
+      const v = parseInt(args[0], 10);
+      if (!Number.isFinite(v) || v < 0) {
+        await reply("❌ 请输入 ≥0 的秒数，例如 /set_lookback 300（0=对比上一次轮询）");
+        break;
+      }
+      settings.pollLookbackSec = v;
+      await reply(
+        v > 0
+          ? `✅ 本轮变化改为对比近 ${fmtWindow(v)}`
+          : "✅ 本轮变化改为对比上一次轮询",
+      );
       break;
     }
     default:
@@ -620,7 +750,8 @@ function startServer() {
       paused: settings.paused,
       pollIntervalSec: settings.pollIntervalSec,
       projects: PROJECTS.length,
-      tracked: lastPrices.size,
+      tracked: priceHistory.size,
+      subscriptions: subscriptions.size,
       uptimeSec: Math.round(process.uptime()),
     }),
   );
@@ -631,24 +762,26 @@ function main() {
   console.log("[boot] Aspecta Telegram Tracker 启动中...");
   console.log(
     `[boot] 间隔=${settings.pollIntervalSec}s 本轮阈值=${settings.pollAlertPercent}% ` +
-      `24H阈值=${settings.dayAlertPercent}% 冷却=${settings.cooldownMin}min ` +
-      `项目数=${PROJECTS.length}`,
+      `回看=${settings.pollLookbackSec}s 24H阈值=${settings.dayAlertPercent}% ` +
+      `冷却=${settings.cooldownMin}min 项目数=${PROJECTS.length}`,
   );
-  if (TOPIC_ID != null) console.log(`[boot] 提醒将发送到话题 topic_id=${TOPIC_ID}`);
+
+  seedSubscriptions();
+  if (TOPIC_ID != null) console.log(`[boot] 默认订阅话题 topic_id=${TOPIC_ID}`);
   if (!BOT_TOKEN) console.warn("[boot] 警告：未设置 TELEGRAM_BOT_TOKEN");
-  if (!CHAT_ID) console.warn("[boot] 警告：未设置 TELEGRAM_CHAT_ID，自动提醒不会发送");
+  if (subscriptions.size === 0) {
+    console.warn(
+      "[boot] 警告：暂无订阅目标，设置 TELEGRAM_CHAT_ID 或在话题里发 /subscribe",
+    );
+  }
 
   startServer();
   registerCommands();
   telegramPollLoop();
   pollLoop();
 
-  if (BOT_TOKEN && CHAT_ID) {
-    sendTelegram(
-      CHAT_ID,
-      "🤖 Aspecta 价格追踪已启动，发送 /menu 打开菜单",
-      threadExtra(TOPIC_ID),
-    );
+  if (BOT_TOKEN && subscriptions.size > 0) {
+    broadcast("🤖 Aspecta 价格追踪已启动，发送 /menu 打开菜单");
   }
 }
 
