@@ -29,6 +29,11 @@ const ASPECTA_API = "https://trade.aspecta.ai/api/hermes/trading/k-line";
 // ── 配置（环境变量 + 运行时可改）────────────────────────────────
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
+// 可选：群组话题(forum topic)的 message_thread_id，提醒会发到该话题
+const TOPIC_ID = (() => {
+  const v = parseInt(process.env.TELEGRAM_TOPIC_ID, 10);
+  return Number.isFinite(v) ? v : null;
+})();
 const PORT = parseInt(process.env.PORT, 10) || 3000;
 
 function intEnv(name, def, min) {
@@ -87,6 +92,14 @@ function esc(s) {
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;");
+}
+
+// 把话题 id 合并进 sendMessage 的附加参数，让消息发到指定 forum topic
+function threadExtra(threadId, extra = {}) {
+  if (threadId != null && Number.isFinite(Number(threadId))) {
+    extra.message_thread_id = Number(threadId);
+  }
+  return extra;
 }
 
 // ── 2 & 3. 请求接口并解析 K 线 ──────────────────────────────────
@@ -296,7 +309,11 @@ async function runPollCycle() {
     }
 
     if (reasons.length) {
-      await sendTelegram(CHAT_ID, alertMessage(item, pollChange, reasons));
+      await sendTelegram(
+        CHAT_ID,
+        alertMessage(item, pollChange, reasons),
+        threadExtra(TOPIC_ID),
+      );
     }
   }
 }
@@ -348,7 +365,7 @@ const HELP_TEXT = [
   "/set_poll &lt;百分比&gt; - 本轮变化提醒阈值",
   "/set_day &lt;百分比&gt; - 24H 变化提醒阈值",
   "/status - 查看当前配置",
-  "/id - 查看当前 chat_id",
+  "/id - 查看当前 chat_id / topic_id",
 ].join("\n");
 
 function statusText() {
@@ -363,7 +380,7 @@ function statusText() {
   ].join("\n");
 }
 
-async function cmdNow(chatId) {
+async function cmdNow(chatId, threadId) {
   const snap = await fetchSnapshot();
   const lines = ["📊 <b>Aspecta 全部项目</b>"];
   for (const it of snap) {
@@ -376,10 +393,10 @@ async function cmdNow(chatId) {
         `1H ${fmtPct(it.change1h)}  24H ${fmtPct(it.change24h)}`,
     );
   }
-  await sendTelegram(chatId, lines.join("\n"));
+  await sendTelegram(chatId, lines.join("\n"), threadExtra(threadId));
 }
 
-async function cmdTop(chatId) {
+async function cmdTop(chatId, threadId) {
   const snap = (await fetchSnapshot()).filter(
     (it) => it.ok && it.change24h != null,
   );
@@ -390,12 +407,16 @@ async function cmdTop(chatId) {
       `${i + 1}. <b>${esc(it.project)}</b>  ${fmtPct(it.change24h)}  ($${fmtPrice(it.price)})`,
     );
   });
-  await sendTelegram(chatId, lines.join("\n"));
+  await sendTelegram(chatId, lines.join("\n"), threadExtra(threadId));
 }
 
-async function cmdDetail(chatId, name) {
+async function cmdDetail(chatId, threadId, name) {
   if (!name) {
-    await sendTelegram(chatId, "用法：/detail &lt;项目&gt;，例如 /detail GAEA");
+    await sendTelegram(
+      chatId,
+      "用法：/detail &lt;项目&gt;，例如 /detail GAEA",
+      threadExtra(threadId),
+    );
     return;
   }
   const snap = await fetchSnapshot();
@@ -403,11 +424,15 @@ async function cmdDetail(chatId, name) {
     (x) => x.project.toLowerCase() === name.toLowerCase(),
   );
   if (!it) {
-    await sendTelegram(chatId, `未找到项目：${esc(name)}`);
+    await sendTelegram(chatId, `未找到项目：${esc(name)}`, threadExtra(threadId));
     return;
   }
   if (!it.ok) {
-    await sendTelegram(chatId, `<b>${esc(it.project)}</b> 暂无数据`);
+    await sendTelegram(
+      chatId,
+      `<b>${esc(it.project)}</b> 暂无数据`,
+      threadExtra(threadId),
+    );
     return;
   }
   const poll = lastPollChange.get(it.project);
@@ -422,90 +447,95 @@ async function cmdDetail(chatId, name) {
       `最高：$${fmtPrice(it.high)}`,
       `最低：$${fmtPrice(it.low)}`,
     ].join("\n"),
+    threadExtra(threadId),
   );
 }
 
-async function handleCommand(chatId, cmd, args) {
+async function handleCommand(chatId, threadId, cmd, args) {
+  const reply = (text, extra = {}) =>
+    sendTelegram(chatId, text, threadExtra(threadId, extra));
   switch (cmd) {
     case "/start":
     case "/help":
-      await sendTelegram(chatId, HELP_TEXT);
+      await reply(HELP_TEXT);
       break;
     case "/menu":
-      await sendTelegram(chatId, "📋 <b>功能菜单</b>\n点击下方按钮操作：", {
+      await reply("📋 <b>功能菜单</b>\n点击下方按钮操作：", {
         reply_markup: MENU_KEYBOARD,
       });
       break;
     case "/status":
-      await sendTelegram(chatId, statusText());
+      await reply(statusText());
       break;
     case "/now":
-      await cmdNow(chatId);
+      await cmdNow(chatId, threadId);
       break;
     case "/top":
-      await cmdTop(chatId);
+      await cmdTop(chatId, threadId);
       break;
     case "/detail":
-      await cmdDetail(chatId, args[0]);
+      await cmdDetail(chatId, threadId, args[0]);
       break;
     case "/pause":
       settings.paused = true;
-      await sendTelegram(chatId, "⏸ 已暂停自动提醒");
+      await reply("⏸ 已暂停自动提醒");
       break;
     case "/resume":
       settings.paused = false;
-      await sendTelegram(chatId, "▶️ 已恢复自动提醒");
+      await reply("▶️ 已恢复自动提醒");
       break;
     case "/set_interval": {
       const v = parseInt(args[0], 10);
       if (!Number.isFinite(v) || v < 10) {
-        await sendTelegram(chatId, "❌ 请输入 ≥10 的秒数，例如 /set_interval 60");
+        await reply("❌ 请输入 ≥10 的秒数，例如 /set_interval 60");
         break;
       }
       settings.pollIntervalSec = v;
-      await sendTelegram(chatId, `✅ 查询间隔已设为 ${v}s`);
+      await reply(`✅ 查询间隔已设为 ${v}s`);
       break;
     }
     case "/set_poll": {
       const v = parseFloat(args[0]);
       if (!Number.isFinite(v) || v < 0) {
-        await sendTelegram(chatId, "❌ 请输入百分比，例如 /set_poll 1");
+        await reply("❌ 请输入百分比，例如 /set_poll 1");
         break;
       }
       settings.pollAlertPercent = v;
-      await sendTelegram(chatId, `✅ 本轮变化阈值已设为 ${v}%`);
+      await reply(`✅ 本轮变化阈值已设为 ${v}%`);
       break;
     }
     case "/set_day": {
       const v = parseFloat(args[0]);
       if (!Number.isFinite(v) || v < 0) {
-        await sendTelegram(chatId, "❌ 请输入百分比，例如 /set_day 5");
+        await reply("❌ 请输入百分比，例如 /set_day 5");
         break;
       }
       settings.dayAlertPercent = v;
-      await sendTelegram(chatId, `✅ 24H 变化阈值已设为 ${v}%`);
+      await reply(`✅ 24H 变化阈值已设为 ${v}%`);
       break;
     }
     default:
-      await sendTelegram(chatId, HELP_TEXT);
+      await reply(HELP_TEXT);
   }
 }
 
 async function handleCallback(cq) {
-  const chatId = cq.message && cq.message.chat ? cq.message.chat.id : null;
+  const msg = cq.message;
+  const chatId = msg && msg.chat ? msg.chat.id : null;
+  const threadId = msg ? msg.message_thread_id : null;
   await answerCallback(cq.id); // 先确认，停止按钮转圈
   if (chatId == null) return;
   if (!isAuthorized(chatId)) {
-    await sendTelegram(chatId, "⛔ 未授权访问");
+    await sendTelegram(chatId, "⛔ 未授权访问", threadExtra(threadId));
     return;
   }
   const data = String(cq.data || "");
   if (!data) return;
   try {
-    await handleCommand(chatId, "/" + data, []);
+    await handleCommand(chatId, threadId, "/" + data, []);
   } catch (e) {
     console.error("[tg] 回调处理出错:", e.message);
-    await sendTelegram(chatId, `❌ 出错了：${esc(e.message)}`);
+    await sendTelegram(chatId, `❌ 出错了：${esc(e.message)}`, threadExtra(threadId));
   }
 }
 
@@ -517,6 +547,7 @@ async function handleUpdate(upd) {
   const msg = upd.message || upd.edited_message;
   if (!msg || !msg.text) return;
   const chatId = msg.chat.id;
+  const threadId = msg.message_thread_id != null ? msg.message_thread_id : null;
   const text = msg.text.trim();
   if (!text.startsWith("/")) return;
 
@@ -525,21 +556,29 @@ async function handleUpdate(upd) {
   const args = parts.slice(1);
 
   if (cmd === "/id") {
-    await sendTelegram(chatId, `🆔 Chat ID: <code>${chatId}</code>`);
+    const lines = [
+      `🆔 Chat ID: <code>${chatId}</code>`,
+      `类型: ${msg.chat.type}`,
+    ];
+    if (threadId != null) {
+      lines.push(`🧵 Topic ID: <code>${threadId}</code>`);
+    }
+    await sendTelegram(chatId, lines.join("\n"), threadExtra(threadId));
     return;
   }
   if (!isAuthorized(chatId)) {
     await sendTelegram(
       chatId,
       "⛔ 未授权。请将本 chat_id 配置到 Railway 的 TELEGRAM_CHAT_ID。",
+      threadExtra(threadId),
     );
     return;
   }
   try {
-    await handleCommand(chatId, cmd, args);
+    await handleCommand(chatId, threadId, cmd, args);
   } catch (e) {
     console.error("[tg] 命令处理出错:", e.message);
-    await sendTelegram(chatId, `❌ 出错了：${esc(e.message)}`);
+    await sendTelegram(chatId, `❌ 出错了：${esc(e.message)}`, threadExtra(threadId));
   }
 }
 
@@ -595,6 +634,7 @@ function main() {
       `24H阈值=${settings.dayAlertPercent}% 冷却=${settings.cooldownMin}min ` +
       `项目数=${PROJECTS.length}`,
   );
+  if (TOPIC_ID != null) console.log(`[boot] 提醒将发送到话题 topic_id=${TOPIC_ID}`);
   if (!BOT_TOKEN) console.warn("[boot] 警告：未设置 TELEGRAM_BOT_TOKEN");
   if (!CHAT_ID) console.warn("[boot] 警告：未设置 TELEGRAM_CHAT_ID，自动提醒不会发送");
 
@@ -604,7 +644,11 @@ function main() {
   pollLoop();
 
   if (BOT_TOKEN && CHAT_ID) {
-    sendTelegram(CHAT_ID, "🤖 Aspecta 价格追踪已启动，发送 /menu 打开菜单");
+    sendTelegram(
+      CHAT_ID,
+      "🤖 Aspecta 价格追踪已启动，发送 /menu 打开菜单",
+      threadExtra(TOPIC_ID),
+    );
   }
 }
 

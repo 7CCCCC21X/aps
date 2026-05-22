@@ -30,8 +30,24 @@
 | `POLL_ALERT_PERCENT` | 否 | `1` | 本轮变化提醒阈值（%） |
 | `DAY_ALERT_PERCENT` | 否 | `5` | 24H 变化提醒阈值（%） |
 | `ALERT_COOLDOWN_MIN` | 否 | `30` | 同项目同类型提醒冷却（分钟） |
+| `TELEGRAM_TOPIC_ID` | 否 | — | 群组话题(forum topic) id，设置后提醒只发到该话题 |
 | `ASPECTA_COOKIE` | 否 | — | 若接口返回 401/403，填登录后的 Cookie |
 | `PORT` | 否 | `3000` | HTTP 端口（Railway 自动注入） |
+
+## 拉进群组 / 发到指定话题
+
+机器人本身没有“激活”开关：只要进程在跑、`TELEGRAM_CHAT_ID` 配对，它就会监听命令并推送提醒。把它用到群里只需三步：
+
+1. **拉进群**：在群里「添加成员」搜索机器人用户名加入。
+   （若加不进，去 @BotFather → `/setjoingroups` → Enable 允许机器人入群。）
+2. **拿群 ID**：在群里发 `/id`，机器人会回复 `Chat ID`（群是负数，超级群形如 `-100…`）。把它填到 `TELEGRAM_CHAT_ID` 并重新部署。
+3. **发到指定话题**（群需开启「话题/Topics」功能）：进入目标话题，发 `/id`，机器人会额外回复 `Topic ID`。把它填到 `TELEGRAM_TOPIC_ID` 并重新部署，自动提醒就只发到该话题。
+
+补充说明：
+
+- 机器人在群里默认开启隐私模式，只能收到以 `/` 开头的命令，这对本机器人足够；多机器人同群时请用 `/now@你的机器人名`。
+- 在某个话题里发命令，机器人的回复会自动留在同一话题；自动提醒则按 `TELEGRAM_TOPIC_ID` 发送（未设置则发到群「General」）。
+- 不设 `TELEGRAM_TOPIC_ID` 也能正常在群里推送，只是不绑定具体话题。
 
 ## Telegram 命令
 
