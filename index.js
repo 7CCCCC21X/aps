@@ -394,11 +394,6 @@ async function pollLoop() {
 }
 
 // ── Telegram 命令（long polling）────────────────────────────────
-function isAuthorized(chatId) {
-  // 未配置 CHAT_ID 时放开，便于初次设置；配置后仅限该 chat
-  return !CHAT_ID || String(chatId) === String(CHAT_ID);
-}
-
 // 点击式菜单（inline keyboard）。callback_data 直接复用命令名
 const MENU_KEYBOARD = {
   inline_keyboard: [
@@ -655,10 +650,6 @@ async function handleCallback(cq) {
   const threadId = msg ? msg.message_thread_id : null;
   await answerCallback(cq.id); // 先确认，停止按钮转圈
   if (chatId == null) return;
-  if (!isAuthorized(chatId)) {
-    await sendTelegram(chatId, "⛔ 未授权访问", threadExtra(threadId));
-    return;
-  }
   const data = String(cq.data || "");
   if (!data) return;
   try {
@@ -694,14 +685,6 @@ async function handleUpdate(upd) {
       lines.push(`🧵 Topic ID: <code>${threadId}</code>`);
     }
     await sendTelegram(chatId, lines.join("\n"), threadExtra(threadId));
-    return;
-  }
-  if (!isAuthorized(chatId)) {
-    await sendTelegram(
-      chatId,
-      "⛔ 未授权。请将本 chat_id 配置到 Railway 的 TELEGRAM_CHAT_ID。",
-      threadExtra(threadId),
-    );
     return;
   }
   try {

@@ -18,14 +18,14 @@
 1. 把本仓库连接到 Railway，新建一个服务（Node）。
 2. 在 **Variables** 里设置环境变量（见下表，不要写进代码）。
 3. Railway 会自动执行 `npm install` 并 `npm start`。
-4. 部署成功后，在 Telegram 里给机器人发 `/id` 获取你的 `chat_id`，填回 `TELEGRAM_CHAT_ID` 并重新部署。
+4. 部署成功后，把机器人拉进群，进入目标话题发 `/subscribe` 即可开始接收提醒（无需配置 `TELEGRAM_CHAT_ID`）。
 
 ## 环境变量
 
 | 变量 | 必填 | 默认 | 说明 |
 | --- | --- | --- | --- |
 | `TELEGRAM_BOT_TOKEN` | 是 | — | 找 @BotFather 创建机器人得到的 Token |
-| `TELEGRAM_CHAT_ID` | 是 | — | 接收提醒的 chat_id（用 `/id` 获取） |
+| `TELEGRAM_CHAT_ID` | 否 | — | 默认订阅的 chat_id（重启后自动恢复；也可只用 `/subscribe`） |
 | `POLL_INTERVAL_SEC` | 否 | `60` | 查询间隔（秒），最小 10 |
 | `POLL_ALERT_PERCENT` | 否 | `1` | 本轮变化提醒阈值（%） |
 | `DAY_ALERT_PERCENT` | 否 | `5` | 24H 变化提醒阈值（%） |
@@ -37,13 +37,14 @@
 
 ## 拉进群组 / 发到指定话题
 
-机器人本身没有“激活”开关：只要进程在跑、有订阅目标，它就会监听命令并推送提醒。推荐用 **`/subscribe`** 绑定话题（支持多个话题）：
+机器人本身没有“激活”开关：只要进程在跑、有订阅目标，它就会监听命令并推送提醒。直接用 **`/subscribe`** 绑定话题即可，无需配置授权：
 
 1. **拉进群**：在群里「添加成员」搜索机器人用户名加入。
    （若加不进，去 @BotFather → `/setjoingroups` → Enable 允许机器人入群。）
-2. **设置授权群**：在群里发 `/id` 拿到 `Chat ID`（群是负数，超级群形如 `-100…`），填到 `TELEGRAM_CHAT_ID` 并重新部署。命令只接受来自该群的请求。
-3. **订阅话题**（群需开启「话题/Topics」功能）：进入目标话题，发 **`/subscribe`**，机器人记录当前 `message_thread_id`，之后所有提醒都会带这个参数发到该话题。可在多个话题分别 `/subscribe`，提醒会同时发到所有订阅话题。
+2. **订阅话题**（群需开启「话题/Topics」功能）：进入目标话题，发 **`/subscribe`**，机器人记录当前 `message_thread_id`，之后所有提醒都会带这个参数发到该话题。可在多个话题分别 `/subscribe`，提醒会同时发到所有订阅话题。
    - `/unsubscribe` 取消当前话题；`/subs` 查看全部订阅目标。
+
+> 命令对所有人开放（无授权限制），机器人会响应它所在的任意群/私聊。`TELEGRAM_CHAT_ID` 不再用于授权，仅作为重启后自动恢复的默认订阅（见下方持久化）。
 
 关于消息为何只发到第一个/General 话题：Telegram 要求发送时带 `message_thread_id` 才会进指定话题，只传 `chat_id` 会落到 General。本机器人已在所有发送（提醒、命令回复、按钮）中带上该参数。
 
