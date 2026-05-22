@@ -61,6 +61,7 @@ const TG_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
 const priceHistory = new Map(); // project -> [{ t, price }]（按时间升序）
 const lastPollChange = new Map(); // project -> 上一轮变化%
 const alertCooldown = new Map(); // `${project}:${type}` -> 时间戳
+const dayState = new Map(); // project -> 24H 区间状态：1 / 0 / -1（用于边沿触发）
 const subscriptions = new Map(); // key -> { chatId, threadId }；提醒会发到这些目标
 
 function subKey(chatId, threadId) {
@@ -329,15 +330,81 @@ async function registerCommands() {
   }
 }
 
-function alertMessage(item, pollChange, reasons) {
+function pollShort() {
+  return settings.pollLookbackSec > 0
+    ? `近${fmtWindow(settings.pollLookbackSec)}`
+    : "本轮";
+}
+
+// 24H 所处区间：1=向上超阈值，-1=向下超阈值，0=阈值内
+function dayBucket(change24h) {
+  if (change24h == null) return 0;
+  if (change24h >= settings.dayAlertPercent) return 1;
+  if (change24h <= -settings.dayAlertPercent) return -1;
+  return 0;
+}
+
+const dirIcon = (x) => (x == null ? "" : x >= 0 ? "🟢" : "🔴");
+
+// 单个项目的告警块（隐藏无数据的行）
+function alertBlock(item, pollChange, reasons) {
+  const primary = item.change24h != null ? item.change24h : pollChange;
+  const arrow = primary != null && primary < 0 ? "📉" : "📈";
+  const metrics = [];
+  if (pollChange != null) {
+    metrics.push(`${pollShort()} ${dirIcon(pollChange)}${fmtPct(pollChange)}`);
+  }
+  if (item.change1h != null) {
+    metrics.push(`1H ${dirIcon(item.change1h)}${fmtPct(item.change1h)}`);
+  }
+  if (item.change24h != null) {
+    metrics.push(`24H ${dirIcon(item.change24h)}${fmtPct(item.change24h)}`);
+  }
   return [
-    `⚠️ <b>Aspecta 价格提醒</b> (${reasons.join(" / ")})`,
-    `<b>${esc(item.project)}</b>`,
-    `最新价：$${fmtPrice(item.price)}`,
-    `${pollLabel()}：${fmtPct(pollChange)}`,
-    `1H变化：${fmtPct(item.change1h)}`,
-    `24H变化：${fmtPct(item.change24h)}`,
+    `${arrow} <b>${esc(item.project)}</b>  $${fmtPrice(item.price)}  <i>[${reasons.join("/")}]</i>`,
+    metrics.join("  "),
   ].join("\n");
+}
+
+// 同一轮触发的多个项目合并成一条消息
+function batchedMessage(triggered) {
+  const sev = (t) =>
+    Math.max(
+      t.pollChange != null ? Math.abs(t.pollChange) : 0,
+      t.item.change24h != null ? Math.abs(t.item.change24h) : 0,
+    );
+  triggered.sort((a, b) => sev(b) - sev(a));
+  const header = `⚠️ <b>Aspecta 异动 (${triggered.length})</b>`;
+  const blocks = triggered.map((t) =>
+    alertBlock(t.item, t.pollChange, t.reasons),
+  );
+  return [header, ...blocks].join("\n\n");
+}
+
+// 启动时的“当前异动”快照
+function startupSnapshot(snapshot) {
+  const hot = snapshot
+    .filter(
+      (it) =>
+        it.ok &&
+        it.change24h != null &&
+        Math.abs(it.change24h) >= settings.dayAlertPercent,
+    )
+    .sort((a, b) => Math.abs(b.change24h) - Math.abs(a.change24h));
+  const lines = ["🤖 <b>Aspecta 价格追踪已启动</b>"];
+  if (hot.length === 0) {
+    lines.push(`当前无明显异动（24H 阈值 ${settings.dayAlertPercent}%）`);
+  } else {
+    lines.push(`当前异动（24H ≥ ${settings.dayAlertPercent}%）：`);
+    for (const it of hot) {
+      const arrow = it.change24h < 0 ? "📉" : "📈";
+      lines.push(
+        `${arrow} <b>${esc(it.project)}</b>  ${fmtPct(it.change24h)}  ($${fmtPrice(it.price)})`,
+      );
+    }
+  }
+  lines.push("", "发送 /menu 打开菜单");
+  return lines.join("\n");
 }
 
 // 把消息发到所有订阅的目标（群/话题）
@@ -348,16 +415,25 @@ async function broadcast(text, extra = {}) {
 }
 
 // ── 定时轮询主循环 ──────────────────────────────────────────────
+let firstCycle = true; // 首轮（含每次重启）只建基线 + 发快照，不轰炸
+
 async function runPollCycle() {
   if (settings.paused) return;
   if (subscriptions.size === 0) return; // 没有订阅目标，无法推送提醒
 
   const snapshot = await fetchSnapshot();
+  const triggered = [];
+
   for (const item of snapshot) {
     if (!item.ok || item.price == null || !isFinite(item.price)) continue;
 
     const pollChange = getPollChange(item.project, item.price);
     if (pollChange != null) lastPollChange.set(item.project, pollChange);
+
+    // 24H 边沿触发：记录上次所处区间，只有“穿越”到新的超阈值区间才报
+    const prevState = dayState.get(item.project);
+    const curState = dayBucket(item.change24h);
+    dayState.set(item.project, curState);
 
     const reasons = [];
     if (
@@ -365,19 +441,29 @@ async function runPollCycle() {
       Math.abs(pollChange) >= settings.pollAlertPercent &&
       canAlert(item.project, "poll")
     ) {
-      reasons.push("本轮");
+      reasons.push(pollShort());
     }
     if (
-      item.change24h != null &&
-      Math.abs(item.change24h) >= settings.dayAlertPercent &&
+      prevState !== undefined && // 首次见到该项目只建基线，不报
+      curState !== 0 &&
+      curState !== prevState &&
       canAlert(item.project, "day")
     ) {
       reasons.push("24H");
     }
 
-    if (reasons.length) {
-      await broadcast(alertMessage(item, pollChange, reasons));
-    }
+    if (reasons.length) triggered.push({ item, pollChange, reasons });
+  }
+
+  // 首轮（或重启后第一轮）：发当前异动快照，不发逐项告警
+  if (firstCycle) {
+    firstCycle = false;
+    await broadcast(startupSnapshot(snapshot));
+    return;
+  }
+
+  if (triggered.length) {
+    await broadcast(batchedMessage(triggered));
   }
 }
 
@@ -761,11 +847,7 @@ function main() {
   startServer();
   registerCommands();
   telegramPollLoop();
-  pollLoop();
-
-  if (BOT_TOKEN && subscriptions.size > 0) {
-    broadcast("🤖 Aspecta 价格追踪已启动，发送 /menu 打开菜单");
-  }
+  pollLoop(); // 首轮会发送“当前异动快照”，无需在此单独发启动消息
 }
 
 if (require.main === module) {
@@ -781,5 +863,9 @@ module.exports = {
   parseSnapshot,
   getPollChange,
   canAlert,
+  dayBucket,
+  alertBlock,
+  batchedMessage,
+  startupSnapshot,
   settings,
 };
