@@ -63,6 +63,11 @@ const LAUNCH_SOON_MIN = (() => {
   const v = parseInt(process.env.LAUNCH_SOON_MIN, 10);
   return Number.isFinite(v) && v >= 1 ? v : 60;
 })();
+// 每隔多少分钟自动提示一次当前即将上市列表（0 = 关闭定时提示，仅保留变化提醒）
+const UPCOMING_DIGEST_MIN = (() => {
+  const v = parseInt(process.env.UPCOMING_DIGEST_MIN, 10);
+  return Number.isFinite(v) && v >= 0 ? v : 60;
+})();
 
 function intEnv(name, def, min) {
   const v = parseInt(process.env[name], 10);
@@ -357,6 +362,15 @@ function upcomingLine(u) {
   }
   parts.push(u.canTrade ? "可交易 ✅" : "可交易 ❌");
   return parts.join("\n");
+}
+
+function upcomingDigest(list, title = "即将上市") {
+  const sorted = list
+    .slice()
+    .sort((a, b) => (a.startAt ?? Infinity) - (b.startAt ?? Infinity));
+  const lines = [`🆕 <b>${title} (${sorted.length})</b>`, ""];
+  for (const u of sorted) lines.push(upcomingLine(u), "");
+  return lines.join("\n").trim();
 }
 
 function parseSnapshot(raw) {
@@ -746,6 +760,7 @@ async function pollLoop() {
 
 // 即将上市监控：首轮静默建基线；之后只在“新项目 / 即将开盘 / 已可交易”时提醒
 let firstUpcomingCycle = true;
+let lastDigestAt = 0; // 上次定时提示时间
 
 async function runUpcomingCycle() {
   if (subscriptions.size === 0) return;
@@ -798,6 +813,16 @@ async function runUpcomingCycle() {
 
   firstUpcomingCycle = false;
   for (const text of events) await broadcast(text);
+
+  // 每隔 UPCOMING_DIGEST_MIN 分钟自动提示一次当前即将上市列表
+  if (
+    UPCOMING_DIGEST_MIN > 0 &&
+    list.length > 0 &&
+    now - lastDigestAt >= UPCOMING_DIGEST_MIN * 60 * 1000
+  ) {
+    lastDigestAt = now;
+    await broadcast(upcomingDigest(list, "即将上市提醒"));
+  }
 }
 
 async function upcomingLoop() {
@@ -873,7 +898,7 @@ function statusText() {
     `冷却时间：${settings.cooldownMin}min（作用域 ${COOLDOWN_SCOPE}）`,
     `订阅目标：${subscriptions.size}`,
     `权限控制：${ADMIN_USER_IDS.size > 0 ? `仅 ${ADMIN_USER_IDS.size} 名管理员` : "开放"}`,
-    `预上市监控：${UPCOMING_ENABLED ? `每 ${UPCOMING_INTERVAL_SEC}s（临近 ${LAUNCH_SOON_MIN}min 提醒）` : "关闭"}`,
+    `预上市监控：${UPCOMING_ENABLED ? `每 ${UPCOMING_INTERVAL_SEC}s 检查` + (UPCOMING_DIGEST_MIN > 0 ? `，每 ${UPCOMING_DIGEST_MIN}min 定时提示` : "") : "关闭"}`,
     `项目数量：${PROJECTS.length}`,
   ].join("\n");
 }
@@ -906,11 +931,7 @@ async function cmdUpcoming(chatId, threadId) {
     await sendTelegram(chatId, "暂无即将上市的项目", threadExtra(threadId));
     return;
   }
-  // 最快开盘的排前面，无时间的排最后
-  list.sort((a, b) => (a.startAt ?? Infinity) - (b.startAt ?? Infinity));
-  const lines = [`🆕 <b>即将上市 (${list.length})</b>`, ""];
-  for (const u of list) lines.push(upcomingLine(u), "");
-  await sendTelegram(chatId, lines.join("\n").trim(), threadExtra(threadId));
+  await sendTelegram(chatId, upcomingDigest(list), threadExtra(threadId));
 }
 
 async function cmdTop(chatId, threadId) {

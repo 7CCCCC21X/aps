@@ -12,7 +12,7 @@
 - **24H 边沿触发**：只有 24H 涨跌从阈值内**穿越**到 `DAY_ALERT_PERCENT` 之外时才报，避免持续偏离时反复刷屏
 - **冷启动静默**：启动/重启后第一轮只建立基线、发一条「当前异动快照」，不会把所有已超阈值的项目一次性轰炸出来
 - **合并推送**：同一轮里多个项目触发时合并成一条消息，并带 🟢/🔴 涨跌图标
-- **即将上市监控**：定时查 `assets-list` 的 pre_launch 组，发现新项目、临近开盘、变为可交易时推送提醒（`/upcoming` 可随时查看）
+- **即将上市监控**：定时查 `assets-list` 的 pre_launch 组，发现新项目、临近开盘、变为可交易时推送提醒；并按 `UPCOMING_DIGEST_MIN`（默认每 60 分钟）自动提示一次当前列表（`/upcoming` 可随时查看）
 - Telegram 命令交互：查询、排行、订阅话题、暂停/恢复、运行时改阈值
 - Express `/health` 接口，供 Railway 健康检查与保活
 
@@ -42,6 +42,7 @@
 | `UPCOMING_ENABLED` | 否 | `true` | 是否监控即将上市（pre_launch）项目 |
 | `UPCOMING_INTERVAL_SEC` | 否 | `300` | 即将上市检查间隔（秒，最小 60） |
 | `LAUNCH_SOON_MIN` | 否 | `60` | 开盘前多少分钟内提醒“即将开盘” |
+| `UPCOMING_DIGEST_MIN` | 否 | `60` | 每隔多少分钟自动提示一次即将上市列表（0=关闭） |
 | `TRADING_CONFIG_ID` | 否 | `1` | assets-list 的交易配置 id |
 | `ASPECTA_COOKIE` | 否 | — | 若接口返回 401/403，填登录后的 Cookie |
 | `PORT` | 否 | `3000` | HTTP 端口（Railway 自动注入） |
