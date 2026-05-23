@@ -26,6 +26,7 @@ const PROJECTS = [
 ];
 
 const ASPECTA_API = "https://trade.aspecta.ai/api/hermes/trading/k-line";
+const ASSETS_API = "https://trade.aspecta.ai/api/hermes/trading/assets-list";
 
 // ── 配置（环境变量 + 运行时可改）────────────────────────────────
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
@@ -50,6 +51,18 @@ const ADMIN_USER_IDS = new Set(
 
 // 持久化文件路径（订阅 + 运行时设置）。指向 Railway Volume 可跨重新部署保留
 const DATA_FILE = process.env.DATA_FILE || "./data.json";
+
+// 即将上市（pre_launch）项目监控
+const TRADING_CONFIG_ID = process.env.TRADING_CONFIG_ID || "1";
+const UPCOMING_ENABLED = process.env.UPCOMING_ENABLED !== "false";
+const UPCOMING_INTERVAL_SEC = (() => {
+  const v = parseInt(process.env.UPCOMING_INTERVAL_SEC, 10);
+  return Number.isFinite(v) && v >= 60 ? v : 300;
+})();
+const LAUNCH_SOON_MIN = (() => {
+  const v = parseInt(process.env.LAUNCH_SOON_MIN, 10);
+  return Number.isFinite(v) && v >= 1 ? v : 60;
+})();
 
 function intEnv(name, def, min) {
   const v = parseInt(process.env[name], 10);
@@ -81,6 +94,7 @@ const lastPollChange = new Map(); // project -> 上一轮变化%
 const alertCooldown = new Map(); // `${project}:${type}` -> 时间戳
 const dayState = new Map(); // project -> 24H 区间状态：1 / 0 / -1（用于边沿触发）
 const subscriptions = new Map(); // key -> { chatId, threadId }；提醒会发到这些目标
+const knownUpcoming = new Map(); // name -> { startAt, canTrade, notifiedSoon }
 
 function subKey(chatId, threadId) {
   return `${chatId}:${threadId == null ? "general" : threadId}`;
@@ -244,6 +258,105 @@ async function fetchSnapshotCached(maxAgeMs = 15000) {
       throw err;
     });
   return snapshotCache.promise;
+}
+
+// ── 即将上市（pre_launch）项目 ──────────────────────────────────
+// 返回字段名不确定，按多个候选名取值，取不到则降级。
+function pickField(obj, names) {
+  for (const n of names) {
+    if (obj && obj[n] != null) return obj[n];
+    if (obj && obj.asset && obj.asset[n] != null) return obj.asset[n];
+  }
+  return null;
+}
+
+function parseUpcoming(raw) {
+  const list = Array.isArray(raw)
+    ? raw
+    : raw && Array.isArray(raw.data)
+      ? raw.data
+      : [];
+  return list.map((item) => {
+    const name = pickField(item, [
+      "name",
+      "symbol",
+      "display_name",
+      "project_name",
+      "project_address",
+      "wallet_address",
+    ]);
+    const startRaw = pickField(item, [
+      "trade_start_time",
+      "trading_start_time",
+      "trade_open_time",
+      "trading_start_at",
+      "start_time",
+      "start_at",
+      "launch_time",
+      "open_time",
+    ]);
+    const startMs = startRaw != null ? Date.parse(String(startRaw)) : NaN;
+    const canTrade = pickField(item, ["can_trade", "canTrade", "tradable"]) === true;
+    const state = pickField(item, ["state", "status"]);
+    return {
+      name: name != null ? String(name) : "?",
+      startAt: Number.isFinite(startMs) ? startMs : null,
+      startRaw: startRaw != null ? String(startRaw) : null,
+      canTrade,
+      state: state != null ? String(state) : null,
+    };
+  });
+}
+
+async function fetchUpcoming(retries = 1) {
+  const url = new URL(ASSETS_API);
+  url.searchParams.set("current_page", "1");
+  url.searchParams.set("page_size", "50");
+  url.searchParams.set("trading_config_id", TRADING_CONFIG_ID);
+  url.searchParams.set("group", "pre_launch");
+  url.searchParams.set("is_test", "false");
+
+  const headers = { accept: "application/json" };
+  if (process.env.ASPECTA_COOKIE) headers.cookie = process.env.ASPECTA_COOKIE;
+
+  let lastErr;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const res = await fetch(url, { headers, signal: AbortSignal.timeout(20000) });
+      if (!res.ok) throw new Error(`assets-list ${res.status} ${res.statusText}`);
+      return parseUpcoming(await res.json());
+    } catch (e) {
+      lastErr = e;
+      if (attempt < retries) await sleep(1000 * (attempt + 1));
+    }
+  }
+  throw lastErr;
+}
+
+function fmtUTC(ms) {
+  return new Date(ms).toISOString().slice(0, 16).replace("T", " ");
+}
+
+function fmtCountdown(ms) {
+  if (ms <= 0) return "已开盘";
+  const totalMin = Math.floor(ms / 60000);
+  const d = Math.floor(totalMin / 1440);
+  const h = Math.floor((totalMin % 1440) / 60);
+  const m = totalMin % 60;
+  if (d > 0) return `${d}天${h}小时后`;
+  if (h > 0) return `${h}小时${m}分后`;
+  return `${m}分钟后`;
+}
+
+function upcomingLine(u) {
+  const parts = [`🆕 <b>${esc(u.name)}</b>`];
+  if (u.startAt != null) {
+    parts.push(`开盘 ${fmtUTC(u.startAt)} UTC（${fmtCountdown(u.startAt - Date.now())}）`);
+  } else if (u.startRaw) {
+    parts.push(`开盘 ${esc(u.startRaw)}`);
+  }
+  parts.push(u.canTrade ? "可交易 ✅" : "可交易 ❌");
+  return parts.join("\n");
 }
 
 function parseSnapshot(raw) {
@@ -414,6 +527,7 @@ async function registerCommands() {
     { command: "menu", description: "打开功能菜单" },
     { command: "now", description: "立即查询全部项目" },
     { command: "top", description: "24H 涨跌排行" },
+    { command: "upcoming", description: "即将上市（pre-launch）项目" },
     { command: "detail", description: "查看单个项目，如 /detail GAEA" },
     { command: "subscribe", description: "把提醒订阅到当前话题" },
     { command: "unsubscribe", description: "取消当前话题的订阅" },
@@ -630,6 +744,77 @@ async function pollLoop() {
   }
 }
 
+// 即将上市监控：首轮静默建基线；之后只在“新项目 / 即将开盘 / 已可交易”时提醒
+let firstUpcomingCycle = true;
+
+async function runUpcomingCycle() {
+  if (subscriptions.size === 0) return;
+  const list = await fetchUpcoming();
+  const now = Date.now();
+  const soonMs = LAUNCH_SOON_MIN * 60 * 1000;
+  const events = [];
+
+  for (const u of list) {
+    const isSoon =
+      u.startAt != null && u.startAt - now > 0 && u.startAt - now <= soonMs;
+    const prev = knownUpcoming.get(u.name);
+
+    if (!prev) {
+      // 首次见到：建基线，不报（运行中新出现的才报）
+      if (!firstUpcomingCycle) {
+        const when = u.startAt != null
+          ? `\n开盘 ${fmtUTC(u.startAt)} UTC（${fmtCountdown(u.startAt - now)}）`
+          : "";
+        events.push(`🆕 <b>新预上市项目</b>：<b>${esc(u.name)}</b>${when}`);
+      }
+      knownUpcoming.set(u.name, {
+        startAt: u.startAt,
+        canTrade: u.canTrade,
+        notifiedSoon: isSoon, // 启动时已临近的不再单独提醒，避免重启刷屏
+      });
+      continue;
+    }
+
+    if (u.canTrade && !prev.canTrade) {
+      events.push(`🚀 <b>${esc(u.name)}</b> 已开盘，现在可以交易了！`);
+    }
+    if (isSoon && !prev.notifiedSoon) {
+      events.push(
+        `⏰ <b>${esc(u.name)}</b> 即将开盘（${fmtCountdown(u.startAt - now)}）\n开盘 ${fmtUTC(u.startAt)} UTC`,
+      );
+    }
+    knownUpcoming.set(u.name, {
+      startAt: u.startAt,
+      canTrade: u.canTrade,
+      notifiedSoon: prev.notifiedSoon || isSoon,
+    });
+  }
+
+  // 清理已离开 pre_launch 列表的项目（已上市/下架）
+  const names = new Set(list.map((u) => u.name));
+  for (const key of [...knownUpcoming.keys()]) {
+    if (!names.has(key)) knownUpcoming.delete(key);
+  }
+
+  firstUpcomingCycle = false;
+  for (const text of events) await broadcast(text);
+}
+
+async function upcomingLoop() {
+  if (!UPCOMING_ENABLED) {
+    console.log("[upcoming] 预上市监控已禁用");
+    return;
+  }
+  while (true) {
+    try {
+      await runUpcomingCycle();
+    } catch (e) {
+      console.error("[upcoming] 出错:", e.message);
+    }
+    await sleep(UPCOMING_INTERVAL_SEC * 1000);
+  }
+}
+
 // ── Telegram 命令（long polling）────────────────────────────────
 // 点击式菜单（inline keyboard）。callback_data 直接复用命令名
 const MENU_KEYBOARD = {
@@ -638,7 +823,10 @@ const MENU_KEYBOARD = {
       { text: "📊 全部项目", callback_data: "now" },
       { text: "🏆 涨跌排行", callback_data: "top" },
     ],
-    [{ text: "⚙️ 当前配置", callback_data: "status" }],
+    [
+      { text: "🆕 即将上市", callback_data: "upcoming" },
+      { text: "⚙️ 当前配置", callback_data: "status" },
+    ],
     [
       { text: "📌 订阅本话题", callback_data: "subscribe" },
       { text: "🚫 取消订阅", callback_data: "unsubscribe" },
@@ -657,6 +845,7 @@ const HELP_TEXT = [
   "/menu - 打开功能菜单",
   "/now - 立即查询全部项目",
   "/top - 24H 涨跌排行",
+  "/upcoming - 即将上市（pre-launch）项目",
   "/detail &lt;项目&gt; - 查看单个项目，如 /detail GAEA",
   "/subscribe - 把提醒订阅到当前话题",
   "/unsubscribe - 取消当前话题的订阅",
@@ -684,6 +873,7 @@ function statusText() {
     `冷却时间：${settings.cooldownMin}min（作用域 ${COOLDOWN_SCOPE}）`,
     `订阅目标：${subscriptions.size}`,
     `权限控制：${ADMIN_USER_IDS.size > 0 ? `仅 ${ADMIN_USER_IDS.size} 名管理员` : "开放"}`,
+    `预上市监控：${UPCOMING_ENABLED ? `每 ${UPCOMING_INTERVAL_SEC}s（临近 ${LAUNCH_SOON_MIN}min 提醒）` : "关闭"}`,
     `项目数量：${PROJECTS.length}`,
   ].join("\n");
 }
@@ -702,6 +892,25 @@ async function cmdNow(chatId, threadId) {
     );
   }
   await sendTelegram(chatId, lines.join("\n"), threadExtra(threadId));
+}
+
+async function cmdUpcoming(chatId, threadId) {
+  let list;
+  try {
+    list = await fetchUpcoming();
+  } catch (e) {
+    await sendTelegram(chatId, `❌ 获取即将上市列表失败：${esc(e.message)}`, threadExtra(threadId));
+    return;
+  }
+  if (list.length === 0) {
+    await sendTelegram(chatId, "暂无即将上市的项目", threadExtra(threadId));
+    return;
+  }
+  // 最快开盘的排前面，无时间的排最后
+  list.sort((a, b) => (a.startAt ?? Infinity) - (b.startAt ?? Infinity));
+  const lines = [`🆕 <b>即将上市 (${list.length})</b>`, ""];
+  for (const u of list) lines.push(upcomingLine(u), "");
+  await sendTelegram(chatId, lines.join("\n").trim(), threadExtra(threadId));
 }
 
 async function cmdTop(chatId, threadId) {
@@ -798,6 +1007,9 @@ async function handleCommand(chatId, threadId, cmd, args) {
       break;
     case "/top":
       await cmdTop(chatId, threadId);
+      break;
+    case "/upcoming":
+      await cmdUpcoming(chatId, threadId);
       break;
     case "/detail":
       await cmdDetail(chatId, threadId, args[0]);
@@ -1087,6 +1299,7 @@ function main() {
   registerCommands();
   telegramPollLoop();
   pollLoop(); // 首轮会发送“当前异动快照”，无需在此单独发启动消息
+  upcomingLoop(); // 即将上市监控
 }
 
 if (require.main === module) {
@@ -1101,6 +1314,7 @@ module.exports = {
   fmtPct,
   esc,
   parseSnapshot,
+  parseUpcoming,
   getPollChange,
   canAlertKey,
   evalDayAlert,
