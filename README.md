@@ -30,12 +30,22 @@
 | `TELEGRAM_CHAT_ID` | 否 | — | 默认订阅的 chat_id（重启后自动恢复；也可只用 `/subscribe`） |
 | `POLL_INTERVAL_SEC` | 否 | `60` | 查询间隔（秒），最小 10 |
 | `POLL_ALERT_PERCENT` | 否 | `1` | 本轮变化提醒阈值（%） |
-| `DAY_ALERT_PERCENT` | 否 | `5` | 24H 变化提醒阈值（%） |
-| `ALERT_COOLDOWN_MIN` | 否 | `30` | 同项目同类型提醒冷却（分钟） |
+| `DAY_ALERT_PERCENT` | 否 | `5` | 24H 变化提醒阈值（%，边沿触发） |
+| `DAY_REARM_PERCENT` | 否 | `阈值-1` | 24H 回滞阈值，回落到此值内才允许再次触发 |
+| `ALERT_COOLDOWN_MIN` | 否 | `30` | 同项目提醒冷却（分钟） |
+| `COOLDOWN_SCOPE` | 否 | `project` | 冷却作用域：`project`=同项目共用；`type`=本轮/24H 各自独立 |
 | `POLL_LOOKBACK_SEC` | 否 | `0` | 本轮变化回看窗口（秒），0=对比上一次轮询 |
 | `TELEGRAM_TOPIC_ID` | 否 | — | 群组话题(forum topic) id，作为默认订阅的话题 |
+| `TELEGRAM_ADMIN_USER_IDS` | 否 | — | 有权改阈值/订阅/暂停的用户 id（逗号分隔）；留空=开放 |
+| `DATA_FILE` | 否 | `./data.json` | 持久化文件路径，指向 Railway Volume 可跨重新部署保留 |
 | `ASPECTA_COOKIE` | 否 | — | 若接口返回 401/403，填登录后的 Cookie |
 | `PORT` | 否 | `3000` | HTTP 端口（Railway 自动注入） |
+
+> 零运行时依赖：健康检查用 Node 内置 `http`，不再依赖 Express。运行 `npm test` 执行测试。
+>
+> **持久化**：订阅与运行时设置会写入 `DATA_FILE`，重启后自动恢复。Railway 默认文件系统在重新部署时会清空，需要跨部署保留请挂载 Volume 并把 `DATA_FILE` 指向其路径（如 `/data/data.json`）。
+>
+> **权限**：设置 `TELEGRAM_ADMIN_USER_IDS` 后，只有这些用户能执行订阅/暂停/改阈值等写类命令；查询类命令对所有人开放。留空则全部开放。
 
 ## 拉进群组 / 发到指定话题
 
@@ -88,12 +98,13 @@
 | `/set_interval 60` | 设置查询间隔（秒） |
 | `/set_poll 1` | 设置本轮变化阈值（%） |
 | `/set_day 5` | 设置 24H 变化阈值（%） |
+| `/set_rearm 4` | 设置 24H 回滞阈值（%） |
 | `/set_cooldown 5` | 设置提醒冷却（分钟） |
 | `/set_lookback 300` | 设置本轮变化回看窗口（秒），0=对比上一次轮询 |
 | `/status` | 查看当前配置 |
 | `/help` | 查看命令列表 |
 
-> 运行时通过命令修改的设置（含 `/subscribe` 订阅）在进程重启后会恢复为环境变量的值。
+> 运行时通过命令修改的设置（含 `/subscribe` 订阅）会写入 `DATA_FILE` 持久化，重启后自动恢复。
 
 ## 本地运行
 

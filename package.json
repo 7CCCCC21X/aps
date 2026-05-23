@@ -4,13 +4,11 @@
   "description": "Telegram bot that tracks Aspecta K-line prices and alerts on changes",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "test": "node --test"
   },
   "engines": {
     "node": ">=18"
-  },
-  "dependencies": {
-    "express": "^4.18.2"
   },
   "license": "MIT"
 }

@@ -1,6 +1,7 @@
 "use strict";
 
-const express = require("express");
+const http = require("http");
+const fs = require("fs");
 
 // ── 1. 固定项目列表 ──────────────────────────────────────────────
 const PROJECTS = [
@@ -36,6 +37,20 @@ const TOPIC_ID = (() => {
 })();
 const PORT = parseInt(process.env.PORT, 10) || 3000;
 
+// 冷却作用域：project=同项目任意原因共用一个冷却（默认，减少刷屏）；type=本轮/24H 各自独立
+const COOLDOWN_SCOPE = process.env.COOLDOWN_SCOPE === "type" ? "type" : "project";
+
+// 有权执行“写”类命令（订阅/暂停/改阈值等）的 Telegram 用户 id；为空表示不限制
+const ADMIN_USER_IDS = new Set(
+  (process.env.TELEGRAM_ADMIN_USER_IDS || "")
+    .split(",")
+    .map((x) => x.trim())
+    .filter(Boolean),
+);
+
+// 持久化文件路径（订阅 + 运行时设置）。指向 Railway Volume 可跨重新部署保留
+const DATA_FILE = process.env.DATA_FILE || "./data.json";
+
 function intEnv(name, def, min) {
   const v = parseInt(process.env[name], 10);
   return Number.isFinite(v) && v >= min ? v : def;
@@ -45,11 +60,14 @@ function floatEnv(name, def) {
   return Number.isFinite(v) && v >= 0 ? v : def;
 }
 
+const dayPctDefault = floatEnv("DAY_ALERT_PERCENT", 5);
 const settings = {
   pollIntervalSec: intEnv("POLL_INTERVAL_SEC", 60, 10),
   pollAlertPercent: floatEnv("POLL_ALERT_PERCENT", 1),
-  dayAlertPercent: floatEnv("DAY_ALERT_PERCENT", 5),
-  cooldownMin: intEnv("ALERT_COOLDOWN_MIN", 30),
+  dayAlertPercent: dayPctDefault,
+  // 24H 回滞：触发用 dayAlertPercent，回落到 dayRearmPercent 内才允许再次触发
+  dayRearmPercent: floatEnv("DAY_REARM_PERCENT", Math.max(0, dayPctDefault - 1)),
+  cooldownMin: intEnv("ALERT_COOLDOWN_MIN", 30, 0),
   // 本轮变化的回看窗口（秒）。0 = 对比上一次轮询；>0 = 对比约 N 秒前的价格
   pollLookbackSec: intEnv("POLL_LOOKBACK_SEC", 0, 0),
   paused: false,
@@ -79,12 +97,74 @@ function seedSubscriptions() {
   if (CHAT_ID) addSubscription(CHAT_ID, TOPIC_ID);
 }
 
+// ── 持久化（订阅 + 运行时设置）──────────────────────────────────
+const PERSISTED_SETTINGS = [
+  "pollIntervalSec",
+  "pollAlertPercent",
+  "dayAlertPercent",
+  "dayRearmPercent",
+  "cooldownMin",
+  "pollLookbackSec",
+  "paused",
+];
+
+function saveState() {
+  try {
+    const data = {
+      subscriptions: [...subscriptions.values()],
+      settings: Object.fromEntries(
+        PERSISTED_SETTINGS.map((k) => [k, settings[k]]),
+      ),
+    };
+    const tmp = `${DATA_FILE}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
+    fs.renameSync(tmp, DATA_FILE); // 原子替换
+  } catch (e) {
+    console.error("[state] 保存失败:", e.message);
+  }
+}
+
+function loadState() {
+  let raw;
+  try {
+    raw = fs.readFileSync(DATA_FILE, "utf8");
+  } catch {
+    return; // 文件不存在，跳过
+  }
+  try {
+    const data = JSON.parse(raw);
+    if (data && typeof data.settings === "object") {
+      for (const k of PERSISTED_SETTINGS) {
+        if (data.settings[k] != null) settings[k] = data.settings[k];
+      }
+    }
+    if (data && Array.isArray(data.subscriptions)) {
+      for (const s of data.subscriptions) {
+        if (s && s.chatId != null) addSubscription(s.chatId, s.threadId);
+      }
+    }
+    console.log(`[state] 已从 ${DATA_FILE} 恢复（订阅 ${subscriptions.size}）`);
+  } catch (e) {
+    console.error("[state] 读取失败:", e.message);
+  }
+}
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // ── 工具函数 ────────────────────────────────────────────────────
 function toPrice(value) {
-  // open_price / close_price / high_price / low_price 为 18 位精度
-  return Number(value) / 1e18;
+  // 价格为 18 位定点整数。纯整数字符串用字符串拼小数再转 Number，
+  // 避免大整数（>2^53）先转 double 再除导致的精度损失。
+  if (value == null) return null;
+  const s = String(value).trim();
+  if (/^-?\d+$/.test(s)) {
+    const neg = s.startsWith("-");
+    const digits = (neg ? s.slice(1) : s).padStart(19, "0");
+    const intPart = digits.slice(0, -18) || "0";
+    const fracPart = digits.slice(-18);
+    return (neg ? -1 : 1) * Number(`${intPart}.${fracPart}`);
+  }
+  return Number(s) / 1e18;
 }
 
 function pct(current, base) {
@@ -122,7 +202,7 @@ function threadExtra(threadId, extra = {}) {
 }
 
 // ── 2 & 3. 请求接口并解析 K 线 ──────────────────────────────────
-async function fetchSnapshot() {
+async function fetchSnapshot(retries = 1) {
   const url = new URL(ASPECTA_API);
   url.searchParams.set("project_address", PROJECTS.join(","));
   url.searchParams.set("offset", PROJECTS.map(() => "24").join(","));
@@ -131,10 +211,39 @@ async function fetchSnapshot() {
   const headers = { accept: "application/json" };
   if (process.env.ASPECTA_COOKIE) headers.cookie = process.env.ASPECTA_COOKIE;
 
-  const res = await fetch(url, { headers, signal: AbortSignal.timeout(20000) });
-  if (!res.ok) throw new Error(`Aspecta API ${res.status} ${res.statusText}`);
-  const data = await res.json();
-  return parseSnapshot(data);
+  let lastErr;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const res = await fetch(url, { headers, signal: AbortSignal.timeout(20000) });
+      if (!res.ok) throw new Error(`Aspecta API ${res.status} ${res.statusText}`);
+      const data = await res.json();
+      return parseSnapshot(data);
+    } catch (e) {
+      lastErr = e;
+      if (attempt < retries) await sleep(1000 * (attempt + 1));
+    }
+  }
+  throw lastErr;
+}
+
+// 带 TTL 缓存 + single-flight，避免命令并发/与轮询重叠时打多次外部请求
+let snapshotCache = { ts: 0, data: null, promise: null };
+async function fetchSnapshotCached(maxAgeMs = 15000) {
+  const now = Date.now();
+  if (snapshotCache.data && now - snapshotCache.ts < maxAgeMs) {
+    return snapshotCache.data;
+  }
+  if (snapshotCache.promise) return snapshotCache.promise;
+  snapshotCache.promise = fetchSnapshot()
+    .then((data) => {
+      snapshotCache = { ts: Date.now(), data, promise: null };
+      return data;
+    })
+    .catch((err) => {
+      snapshotCache.promise = null;
+      throw err;
+    });
+  return snapshotCache.promise;
 }
 
 function parseSnapshot(raw) {
@@ -157,8 +266,16 @@ function parseSnapshot(raw) {
     const price = toPrice(latest.close_price);
     const change24h = pct(price, toPrice(first.open_price));
     const change1h = prev ? pct(price, toPrice(prev.close_price)) : null;
-    const high = latest.high_price != null ? toPrice(latest.high_price) : null;
-    const low = latest.low_price != null ? toPrice(latest.low_price) : null;
+
+    // 24H 区间内所有 K 线的最高/最低
+    const highs = kline
+      .map((x) => toPrice(x.high_price))
+      .filter((v) => v != null && isFinite(v));
+    const lows = kline
+      .map((x) => toPrice(x.low_price))
+      .filter((v) => v != null && isFinite(v));
+    const high24h = highs.length ? Math.max(...highs) : null;
+    const low24h = lows.length ? Math.min(...lows) : null;
 
     return {
       project,
@@ -166,8 +283,8 @@ function parseSnapshot(raw) {
       price,
       change1h,
       change24h,
-      high,
-      low,
+      high24h,
+      low24h,
       candles: kline.length,
     };
   });
@@ -219,8 +336,7 @@ function pollLabel() {
 }
 
 // ── 5. 冷却判断 ─────────────────────────────────────────────────
-function canAlert(project, type) {
-  const key = `${project}:${type}`;
+function canAlertKey(key) {
   const now = Date.now();
   const last = alertCooldown.get(key) || 0;
   if (now - last < settings.cooldownMin * 60 * 1000) return false;
@@ -308,6 +424,7 @@ async function registerCommands() {
     { command: "set_interval", description: "设置查询间隔（秒）" },
     { command: "set_poll", description: "设置本轮变化阈值（%）" },
     { command: "set_day", description: "设置 24H 变化阈值（%）" },
+    { command: "set_rearm", description: "设置 24H 回滞阈值（%）" },
     { command: "set_cooldown", description: "设置提醒冷却（分钟）" },
     { command: "set_lookback", description: "设置本轮变化回看窗口（秒）" },
     { command: "id", description: "查看当前 chat_id / topic_id" },
@@ -336,12 +453,46 @@ function pollShort() {
     : "本轮";
 }
 
-// 24H 所处区间：1=向上超阈值，-1=向下超阈值，0=阈值内
-function dayBucket(change24h) {
-  if (change24h == null) return 0;
-  if (change24h >= settings.dayAlertPercent) return 1;
-  if (change24h <= -settings.dayAlertPercent) return -1;
-  return 0;
+// 24H 边沿触发 + 回滞：返回是否应触发 24H 提醒（不消费冷却）。
+// dayState: 0=已武装/正常, 1=已锁定向上, -1=已锁定向下。
+// 触发用 dayAlertPercent，回落到 dayRearmPercent 内才重新武装，避免在阈值附近抖动反复触发。
+function evalDayAlert(project, change24h) {
+  if (change24h == null) return false;
+  const trig = settings.dayAlertPercent;
+  const rearm = Math.min(settings.dayRearmPercent, trig);
+  const prev = dayState.get(project);
+  let state = prev === undefined ? null : prev;
+  let fire = false;
+
+  if (state === null) {
+    // 冷启动/首次见到：只建立基线，不报
+    state = change24h >= trig ? 1 : change24h <= -trig ? -1 : 0;
+  } else if (state === 0) {
+    if (change24h >= trig) {
+      state = 1;
+      fire = true;
+    } else if (change24h <= -trig) {
+      state = -1;
+      fire = true;
+    }
+  } else if (state === 1) {
+    if (change24h <= -trig) {
+      state = -1;
+      fire = true;
+    } else if (change24h < rearm) {
+      state = 0; // 回落到再武装线内
+    }
+  } else {
+    // state === -1
+    if (change24h >= trig) {
+      state = 1;
+      fire = true;
+    } else if (change24h > -rearm) {
+      state = 0;
+    }
+  }
+  dayState.set(project, state);
+  return fire;
 }
 
 const dirIcon = (x) => (x == null ? "" : x >= 0 ? "🟢" : "🔴");
@@ -422,6 +573,7 @@ async function runPollCycle() {
   if (subscriptions.size === 0) return; // 没有订阅目标，无法推送提醒
 
   const snapshot = await fetchSnapshot();
+  snapshotCache = { ts: Date.now(), data: snapshot, promise: null }; // 供命令复用
   const triggered = [];
 
   for (const item of snapshot) {
@@ -430,29 +582,28 @@ async function runPollCycle() {
     const pollChange = getPollChange(item.project, item.price);
     if (pollChange != null) lastPollChange.set(item.project, pollChange);
 
-    // 24H 边沿触发：记录上次所处区间，只有“穿越”到新的超阈值区间才报
-    const prevState = dayState.get(item.project);
-    const curState = dayBucket(item.change24h);
-    dayState.set(item.project, curState);
+    const pollHit =
+      pollChange != null && Math.abs(pollChange) >= settings.pollAlertPercent;
+    const dayHit = evalDayAlert(item.project, item.change24h); // 边沿+回滞，更新 dayState
 
-    const reasons = [];
-    if (
-      pollChange != null &&
-      Math.abs(pollChange) >= settings.pollAlertPercent &&
-      canAlert(item.project, "poll")
-    ) {
-      reasons.push(pollShort());
-    }
-    if (
-      prevState !== undefined && // 首次见到该项目只建基线，不报
-      curState !== 0 &&
-      curState !== prevState &&
-      canAlert(item.project, "day")
-    ) {
-      reasons.push("24H");
-    }
+    if (!pollHit && !dayHit) continue;
 
-    if (reasons.length) triggered.push({ item, pollChange, reasons });
+    // 冷却：project 作用域下同项目共用一个冷却并合并原因；type 作用域下本轮/24H 各自独立
+    let types;
+    if (COOLDOWN_SCOPE === "type") {
+      types = [];
+      if (pollHit && canAlertKey(`${item.project}:poll`)) types.push("poll");
+      if (dayHit && canAlertKey(`${item.project}:day`)) types.push("day");
+    } else {
+      const hits = [];
+      if (pollHit) hits.push("poll");
+      if (dayHit) hits.push("day");
+      types = canAlertKey(`${item.project}:any`) ? hits : [];
+    }
+    if (types.length === 0) continue;
+
+    const reasons = types.map((t) => (t === "poll" ? pollShort() : "24H"));
+    triggered.push({ item, pollChange, reasons });
   }
 
   // 首轮（或重启后第一轮）：发当前异动快照，不发逐项告警
@@ -515,7 +666,8 @@ const HELP_TEXT = [
   "/set_interval &lt;秒&gt; - 设置查询间隔（最小 10）",
   "/set_poll &lt;百分比&gt; - 本轮变化提醒阈值",
   "/set_day &lt;百分比&gt; - 24H 变化提醒阈值",
-  "/set_cooldown &lt;分钟&gt; - 同项目同类型提醒冷却",
+  "/set_rearm &lt;百分比&gt; - 24H 回滞阈值（回落到此值内才再次触发）",
+  "/set_cooldown &lt;分钟&gt; - 同项目提醒冷却",
   "/set_lookback &lt;秒&gt; - 本轮变化回看窗口（0=对比上一次轮询）",
   "/status - 查看当前配置",
   "/id - 查看当前 chat_id / topic_id",
@@ -528,15 +680,16 @@ function statusText() {
     `查询间隔：${settings.pollIntervalSec}s`,
     `本轮阈值：${settings.pollAlertPercent}%`,
     `本轮窗口：${settings.pollLookbackSec > 0 ? fmtWindow(settings.pollLookbackSec) : "上一次轮询"}`,
-    `24H阈值：${settings.dayAlertPercent}%`,
-    `冷却时间：${settings.cooldownMin}min`,
+    `24H阈值：${settings.dayAlertPercent}%（回滞 ${settings.dayRearmPercent}%）`,
+    `冷却时间：${settings.cooldownMin}min（作用域 ${COOLDOWN_SCOPE}）`,
     `订阅目标：${subscriptions.size}`,
+    `权限控制：${ADMIN_USER_IDS.size > 0 ? `仅 ${ADMIN_USER_IDS.size} 名管理员` : "开放"}`,
     `项目数量：${PROJECTS.length}`,
   ].join("\n");
 }
 
 async function cmdNow(chatId, threadId) {
-  const snap = await fetchSnapshot();
+  const snap = await fetchSnapshotCached();
   const lines = ["📊 <b>Aspecta 全部项目</b>"];
   for (const it of snap) {
     if (!it.ok) {
@@ -552,7 +705,7 @@ async function cmdNow(chatId, threadId) {
 }
 
 async function cmdTop(chatId, threadId) {
-  const snap = (await fetchSnapshot()).filter(
+  const snap = (await fetchSnapshotCached()).filter(
     (it) => it.ok && it.change24h != null,
   );
   snap.sort((a, b) => b.change24h - a.change24h);
@@ -574,7 +727,7 @@ async function cmdDetail(chatId, threadId, name) {
     );
     return;
   }
-  const snap = await fetchSnapshot();
+  const snap = await fetchSnapshotCached();
   const it = snap.find(
     (x) => x.project.toLowerCase() === name.toLowerCase(),
   );
@@ -599,11 +752,29 @@ async function cmdDetail(chatId, threadId, name) {
       `${pollLabel()}：${poll != null ? fmtPct(poll) : "N/A"}`,
       `1H变化：${fmtPct(it.change1h)}`,
       `24H变化：${fmtPct(it.change24h)}`,
-      `最高：$${fmtPrice(it.high)}`,
-      `最低：$${fmtPrice(it.low)}`,
+      `24H最高：$${fmtPrice(it.high24h)}`,
+      `24H最低：$${fmtPrice(it.low24h)}`,
     ].join("\n"),
     threadExtra(threadId),
   );
+}
+
+// 会修改状态的命令（订阅/暂停/改阈值等），受管理员限制并触发持久化
+const MUTATING_COMMANDS = new Set([
+  "/subscribe",
+  "/unsubscribe",
+  "/pause",
+  "/resume",
+  "/set_interval",
+  "/set_poll",
+  "/set_day",
+  "/set_rearm",
+  "/set_cooldown",
+  "/set_lookback",
+]);
+
+function isAdminUser(userId) {
+  return ADMIN_USER_IDS.size === 0 || ADMIN_USER_IDS.has(String(userId));
 }
 
 async function handleCommand(chatId, threadId, cmd, args) {
@@ -701,6 +872,16 @@ async function handleCommand(chatId, threadId, cmd, args) {
       await reply(`✅ 24H 变化阈值已设为 ${v}%`);
       break;
     }
+    case "/set_rearm": {
+      const v = parseFloat(args[0]);
+      if (!Number.isFinite(v) || v < 0) {
+        await reply("❌ 请输入百分比，例如 /set_rearm 4（24H 回落到此值内才再次允许触发）");
+        break;
+      }
+      settings.dayRearmPercent = v;
+      await reply(`✅ 24H 回滞阈值已设为 ${v}%`);
+      break;
+    }
     case "/set_cooldown": {
       const v = parseInt(args[0], 10);
       if (!Number.isFinite(v) || v < 0) {
@@ -728,6 +909,7 @@ async function handleCommand(chatId, threadId, cmd, args) {
     default:
       await reply(HELP_TEXT);
   }
+  if (MUTATING_COMMANDS.has(cmd)) saveState();
 }
 
 async function handleCallback(cq) {
@@ -738,8 +920,13 @@ async function handleCallback(cq) {
   if (chatId == null) return;
   const data = String(cq.data || "");
   if (!data) return;
+  const cmdName = "/" + data;
+  if (MUTATING_COMMANDS.has(cmdName) && !isAdminUser(cq.from && cq.from.id)) {
+    await sendTelegram(chatId, "❌ 无权限执行该命令", threadExtra(threadId));
+    return;
+  }
   try {
-    await handleCommand(chatId, threadId, "/" + data, []);
+    await handleCommand(chatId, threadId, cmdName, []);
   } catch (e) {
     console.error("[tg] 回调处理出错:", e.message);
     await sendTelegram(chatId, `❌ 出错了：${esc(e.message)}`, threadExtra(threadId));
@@ -773,6 +960,10 @@ async function handleUpdate(upd) {
     await sendTelegram(chatId, lines.join("\n"), threadExtra(threadId));
     return;
   }
+  if (MUTATING_COMMANDS.has(cmd) && !isAdminUser(msg.from && msg.from.id)) {
+    await sendTelegram(chatId, "❌ 无权限执行该命令", threadExtra(threadId));
+    return;
+  }
   try {
     await handleCommand(chatId, threadId, cmd, args);
   } catch (e) {
@@ -781,11 +972,33 @@ async function handleUpdate(upd) {
   }
 }
 
+// long polling 与 webhook 互斥；启动时先清理 webhook，否则 getUpdates 不工作
+async function deleteWebhook() {
+  if (!BOT_TOKEN) return;
+  try {
+    const res = await fetch(`${TG_API}/deleteWebhook`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ drop_pending_updates: false }),
+      signal: AbortSignal.timeout(15000),
+    });
+    const data = await res.json().catch(() => null);
+    if (!res.ok || !data || !data.ok) {
+      console.error("[tg] deleteWebhook 失败", res.status, data);
+    } else {
+      console.log("[tg] 已清理 webhook，使用 long polling");
+    }
+  } catch (e) {
+    console.error("[tg] deleteWebhook 异常:", e.message);
+  }
+}
+
 async function telegramPollLoop() {
   if (!BOT_TOKEN) {
     console.warn("[tg] 未设置 TELEGRAM_BOT_TOKEN，命令监听已禁用");
     return;
   }
+  await deleteWebhook();
   let offset = 0;
   while (true) {
     try {
@@ -793,8 +1006,27 @@ async function telegramPollLoop() {
         `${TG_API}/getUpdates?timeout=30&offset=${offset}`,
         { signal: AbortSignal.timeout(40000) },
       );
-      const data = await res.json();
-      if (data.ok && Array.isArray(data.result)) {
+      if (res.status === 429) {
+        const data = await res.json().catch(() => null);
+        const retry = (data && data.parameters && data.parameters.retry_after) || 5;
+        console.warn(`[tg] 429 限流，${retry}s 后重试`);
+        await sleep(retry * 1000);
+        continue;
+      }
+      if (res.status === 409) {
+        console.error(
+          "[tg] 409 Conflict：可能有另一个实例也在 getUpdates（旧实例未退出 / 双实例）",
+        );
+        await sleep(5000);
+        continue;
+      }
+      const data = await res.json().catch(() => null);
+      if (!res.ok || !data || !data.ok) {
+        console.error("[tg] getUpdates 异常", res.status, data);
+        await sleep(3000);
+        continue;
+      }
+      if (Array.isArray(data.result)) {
         for (const upd of data.result) {
           offset = upd.update_id + 1;
           await handleUpdate(upd);
@@ -807,35 +1039,42 @@ async function telegramPollLoop() {
   }
 }
 
-// ── Express 健康检查 + 启动 ─────────────────────────────────────
+// ── 健康检查（Node 内置 http，无第三方依赖）─────────────────────
 function startServer() {
-  const app = express();
-  app.get("/", (_req, res) =>
-    res.send("Aspecta Telegram Tracker is running"),
-  );
-  app.get("/health", (_req, res) =>
-    res.json({
-      status: "ok",
-      paused: settings.paused,
-      pollIntervalSec: settings.pollIntervalSec,
-      projects: PROJECTS.length,
-      tracked: priceHistory.size,
-      subscriptions: subscriptions.size,
-      uptimeSec: Math.round(process.uptime()),
-    }),
-  );
-  app.listen(PORT, () => console.log(`[http] 监听端口 ${PORT}`));
+  const server = http.createServer((req, res) => {
+    if (req.url === "/health") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          status: "ok",
+          paused: settings.paused,
+          pollIntervalSec: settings.pollIntervalSec,
+          projects: PROJECTS.length,
+          tracked: priceHistory.size,
+          subscriptions: subscriptions.size,
+          uptimeSec: Math.round(process.uptime()),
+        }),
+      );
+      return;
+    }
+    res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
+    res.end("Aspecta Telegram Tracker is running");
+  });
+  server.listen(PORT, () => console.log(`[http] 监听端口 ${PORT}`));
 }
 
 function main() {
   console.log("[boot] Aspecta Telegram Tracker 启动中...");
+
+  loadState(); // 先恢复持久化的订阅 + 设置
+
   console.log(
     `[boot] 间隔=${settings.pollIntervalSec}s 本轮阈值=${settings.pollAlertPercent}% ` +
       `回看=${settings.pollLookbackSec}s 24H阈值=${settings.dayAlertPercent}% ` +
-      `冷却=${settings.cooldownMin}min 项目数=${PROJECTS.length}`,
+      `回滞=${settings.dayRearmPercent}% 冷却=${settings.cooldownMin}min ` +
+      `作用域=${COOLDOWN_SCOPE} 项目数=${PROJECTS.length}`,
   );
-
-  seedSubscriptions();
+  seedSubscriptions(); // 再用环境变量兜底默认订阅
   if (TOPIC_ID != null) console.log(`[boot] 默认订阅话题 topic_id=${TOPIC_ID}`);
   if (!BOT_TOKEN) console.warn("[boot] 警告：未设置 TELEGRAM_BOT_TOKEN");
   if (subscriptions.size === 0) {
@@ -860,12 +1099,18 @@ module.exports = {
   pct,
   fmtPrice,
   fmtPct,
+  esc,
   parseSnapshot,
   getPollChange,
-  canAlert,
-  dayBucket,
+  canAlertKey,
+  evalDayAlert,
   alertBlock,
   batchedMessage,
   startupSnapshot,
+  isAdminUser,
+  MUTATING_COMMANDS,
+  ADMIN_USER_IDS,
   settings,
+  // 暴露内部状态供测试重置
+  _state: { priceHistory, lastPollChange, alertCooldown, dayState, subscriptions },
 };
