@@ -467,12 +467,12 @@ function findNumeric(obj, exactNorm, fallbackRe, excludeRe) {
   return null;
 }
 
-// arena 接口没有“市值”，可用的规模字段是成交额/参与人数等（多为 1e18 定点的 USDT）：
-//   asset.total_volume 累计成交额 · asset.participants_count 参与人数
-const VOL_EXACT = ["totalvolume", "tradingvolume", "volumeusd", "volume"];
+// arena 接口没有“市值”，可用的规模字段是近期成交额/参与人数等（多为 1e18 定点的 USDT）：
+//   recent_volume 近期成交额 · asset.participants_count 参与人数
+const VOL_EXACT = ["recentvolume", "volumeusd", "volume"];
 const PART_EXACT = ["participantscount", "participants", "holderscount", "holders"];
 
-// 解析市场列表：name + 累计成交额 + 参与人数（字段名探测，取不到则为 null）
+// 解析市场列表：name + 近期成交额 + 参与人数（字段名探测，取不到则为 null）
 function parseArenaMarkets(raw) {
   const list = Array.isArray(raw)
     ? raw
@@ -485,7 +485,7 @@ function parseArenaMarkets(raw) {
     if (name == null) continue;
     out.push({
       name: String(name),
-      volume: findNumeric(item, VOL_EXACT, /total.*volume|trading.*volume/, /(asp|rank|change|pct|percent)/),
+      volume: findNumeric(item, VOL_EXACT, /recent.*volume/, /(asp|total|rank|change|pct|percent|interest)/),
       participants: findNumeric(item, PART_EXACT, /participant|holder/, /(rank|pct|percent)/),
     });
   }
@@ -518,7 +518,7 @@ async function fetchActiveAssetNames(retries = 1) {
   return parseActiveAssets(await fetchArenaJson(retries));
 }
 
-// 拉取市场列表（含成交额/参与人数），用于按成交额排序的全量播报
+// 拉取市场列表（含近期成交额/参与人数），用于按近期成交额排序的全量播报
 async function fetchArenaMarkets(retries = 1) {
   return parseArenaMarkets(await fetchArenaJson(retries));
 }
@@ -784,6 +784,33 @@ async function answerCallback(callbackId, text) {
   }
 }
 
+// 原地更新一条已发出的消息（用于设置卡片点按后刷新）
+async function editMessageText(chatId, messageId, text, replyMarkup) {
+  if (!BOT_TOKEN) return;
+  const body = {
+    chat_id: chatId,
+    message_id: messageId,
+    text,
+    parse_mode: "HTML",
+    disable_web_page_preview: true,
+  };
+  if (replyMarkup) body.reply_markup = replyMarkup;
+  try {
+    const res = await fetch(`${TG_API}/editMessageText`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!res.ok) {
+      const t = await res.text();
+      if (!t.includes("not modified")) console.error(`[tg] editMessageText ${res.status}`, t);
+    }
+  } catch (e) {
+    console.error("[tg] editMessageText 失败:", e.message);
+  }
+}
+
 // 启动时注册命令菜单（Telegram 输入框旁的 “菜单” 按钮）
 async function registerCommands() {
   if (!BOT_TOKEN) return;
@@ -801,6 +828,7 @@ async function registerCommands() {
     { command: "pause", description: "暂停自动提醒" },
     { command: "resume", description: "恢复自动提醒" },
     { command: "status", description: "查看当前配置" },
+    { command: "settings", description: "打开设置卡片（按钮调整）" },
     { command: "set_interval", description: "设置查询间隔（秒）" },
     { command: "set_poll", description: "设置本轮变化阈值（%）" },
     { command: "set_day", description: "设置 24H 变化阈值（%）" },
@@ -1168,9 +1196,75 @@ const MENU_KEYBOARD = {
       { text: "⏸ 暂停提醒", callback_data: "pause" },
       { text: "▶️ 恢复提醒", callback_data: "resume" },
     ],
-    [{ text: "❓ 帮助", callback_data: "help" }],
+    [
+      { text: "⚙️ 设置", callback_data: "settings" },
+      { text: "❓ 帮助", callback_data: "help" },
+    ],
   ],
 };
+
+// 设置卡片里可点按调整的字段：步进、范围、显示
+const CFG_FIELDS = {
+  poll: {
+    label: "本轮阈值", unit: "%", step: 0.5, min: 0.5, max: 50,
+    get: () => settings.pollAlertPercent, set: (v) => (settings.pollAlertPercent = v),
+  },
+  interval: {
+    label: "查询间隔", unit: "s", step: 5, min: 10, max: 3600,
+    get: () => settings.pollIntervalSec, set: (v) => (settings.pollIntervalSec = v),
+  },
+  lookback: {
+    label: "本轮窗口", unit: "s", step: 15, min: 0, max: 3600,
+    get: () => settings.pollLookbackSec, set: (v) => (settings.pollLookbackSec = v),
+  },
+  day: {
+    label: "24H阈值", unit: "%", step: 0.5, min: 0.5, max: 100,
+    get: () => settings.dayAlertPercent, set: (v) => (settings.dayAlertPercent = v),
+  },
+  cooldown: {
+    label: "冷却", unit: "min", step: 5, min: 0, max: 1440,
+    get: () => settings.cooldownMin, set: (v) => (settings.cooldownMin = v),
+  },
+};
+
+function cfgBtnLabel(field) {
+  const f = CFG_FIELDS[field];
+  const v = f.get();
+  const shown = field === "lookback" && v === 0 ? "上一轮" : `${v}${f.unit}`;
+  return `${f.label} ${shown}`;
+}
+
+// 设置卡片：文字说明 + 可点按调整的内联键盘
+function settingsCard() {
+  const s = settings;
+  const text = [
+    "⚙️ <b>提醒设置</b>",
+    "点下方按钮调整，改完立即生效",
+    "",
+    `自动提醒：${s.paused ? "⏸ 已暂停" : "▶️ 运行中"}`,
+    `本轮阈值：${s.pollAlertPercent}%（${s.pollLookbackSec > 0 ? fmtWindow(s.pollLookbackSec) : "上一次轮询"}内变化超过即报）`,
+    `查询间隔：${s.pollIntervalSec}s`,
+    `24H阈值：${s.dayAlertPercent}%（回滞 ${s.dayRearmPercent}%）`,
+    `冷却：${s.cooldownMin}min`,
+  ].join("\n");
+  const row = (field) => [
+    { text: "➖", callback_data: `cfg:${field}:dec` },
+    { text: cfgBtnLabel(field), callback_data: "cfg:nop" },
+    { text: "➕", callback_data: `cfg:${field}:inc` },
+  ];
+  const reply_markup = {
+    inline_keyboard: [
+      [{ text: s.paused ? "▶️ 恢复提醒" : "⏸ 暂停提醒", callback_data: "cfg:pause:toggle" }],
+      row("poll"),
+      row("interval"),
+      row("lookback"),
+      row("day"),
+      row("cooldown"),
+      [{ text: "🔙 返回菜单", callback_data: "menu" }],
+    ],
+  };
+  return { text, reply_markup };
+}
 
 const HELP_TEXT = [
   "🤖 <b>Aspecta 价格追踪机器人</b>",
@@ -1194,6 +1288,7 @@ const HELP_TEXT = [
   "/set_cooldown &lt;分钟&gt; - 同项目提醒冷却",
   "/set_lookback &lt;秒&gt; - 本轮变化回看窗口（0=对比上一次轮询）",
   "/status - 查看当前配置",
+  "/settings - 打开设置卡片（按钮调整阈值/间隔等）",
   "/id - 查看当前 chat_id / topic_id",
 ].join("\n");
 
@@ -1238,9 +1333,9 @@ async function buildAllProjectsDigest() {
       return { it, volume: m ? m.volume : null, participants: m ? m.participants : null };
     });
 
-    // 按累计成交额排序；接口无成交额时退化为按参与人数；都没有则按 24H 跌幅
+    // 按近期成交额排序；接口无成交额时退化为按参与人数；都没有则按 24H 跌幅
     let key, label;
-    if (rows.some((r) => r.volume != null)) { key = "volume"; label = "按成交额"; }
+    if (rows.some((r) => r.volume != null)) { key = "volume"; label = "按近期成交额"; }
     else if (rows.some((r) => r.participants != null)) { key = "participants"; label = "按参与数"; }
     else { key = null; label = "按 24H 跌幅"; }
     rows.sort((a, b) => {
@@ -1273,6 +1368,11 @@ async function buildAllProjectsDigest() {
 async function cmdAll(chatId, threadId) {
   const chunks = await buildAllProjectsDigest();
   for (const text of chunks) await sendTelegram(chatId, text, threadExtra(threadId));
+}
+
+async function cmdSettings(chatId, threadId) {
+  const { text, reply_markup } = settingsCard();
+  await sendTelegram(chatId, text, threadExtra(threadId, { reply_markup }));
 }
 
 // 隐藏排查命令：打印 arena 接口首条记录的字段名+值，用于确认“市值”字段的真实名字
@@ -1419,6 +1519,9 @@ async function handleCommand(chatId, threadId, cmd, args) {
       break;
     case "/status":
       await reply(statusText());
+      break;
+    case "/settings":
+      await cmdSettings(chatId, threadId);
       break;
     case "/now":
       await cmdNow(chatId, threadId);
@@ -1591,6 +1694,37 @@ async function handleCallback(cq) {
         : `🔔 已恢复「${esc(name)}」的上市提醒`,
       threadExtra(threadId),
     );
+    return;
+  }
+
+  // 设置卡片：点按调整设置并原地刷新卡片
+  if (data.startsWith("cfg:")) {
+    if (!isAdminUser(cq.from && cq.from.id)) {
+      await sendTelegram(chatId, "❌ 无权限执行该命令", threadExtra(threadId));
+      return;
+    }
+    const [, field, action] = data.split(":");
+    if (field === "nop") return; // 仅展示的标签按钮
+    let changed = false;
+    if (field === "pause") {
+      settings.paused = !settings.paused;
+      changed = true;
+    } else if (CFG_FIELDS[field]) {
+      const f = CFG_FIELDS[field];
+      const cur = f.get();
+      let next = action === "inc" ? cur + f.step : cur - f.step;
+      next = Math.min(f.max, Math.max(f.min, Math.round(next / f.step) * f.step));
+      next = Math.round(next * 100) / 100; // 修正浮点误差
+      if (next !== cur) {
+        f.set(next);
+        changed = true;
+      }
+    }
+    if (changed) {
+      saveState();
+      const { text, reply_markup } = settingsCard();
+      if (msg) await editMessageText(chatId, msg.message_id, text, reply_markup);
+    }
     return;
   }
 
