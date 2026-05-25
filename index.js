@@ -55,18 +55,10 @@ const DATA_FILE = process.env.DATA_FILE || "./data.json";
 // 即将上市（pre_launch）项目监控
 const TRADING_CONFIG_ID = process.env.TRADING_CONFIG_ID || "1";
 const UPCOMING_ENABLED = process.env.UPCOMING_ENABLED !== "false";
+// 多久提示一次当前即将上市列表（秒，最小 60）。每次提示每个未静音的项目发一张带「停止」按钮的卡片
 const UPCOMING_INTERVAL_SEC = (() => {
   const v = parseInt(process.env.UPCOMING_INTERVAL_SEC, 10);
   return Number.isFinite(v) && v >= 60 ? v : 300;
-})();
-const LAUNCH_SOON_MIN = (() => {
-  const v = parseInt(process.env.LAUNCH_SOON_MIN, 10);
-  return Number.isFinite(v) && v >= 1 ? v : 60;
-})();
-// 每隔多少分钟自动提示一次当前即将上市列表（0 = 关闭定时提示，仅保留变化提醒）
-const UPCOMING_DIGEST_MIN = (() => {
-  const v = parseInt(process.env.UPCOMING_DIGEST_MIN, 10);
-  return Number.isFinite(v) && v >= 0 ? v : 60;
 })();
 
 function intEnv(name, def, min) {
@@ -81,7 +73,7 @@ function floatEnv(name, def) {
 const dayPctDefault = floatEnv("DAY_ALERT_PERCENT", 5);
 const settings = {
   pollIntervalSec: intEnv("POLL_INTERVAL_SEC", 60, 10),
-  pollAlertPercent: floatEnv("POLL_ALERT_PERCENT", 1),
+  pollAlertPercent: floatEnv("POLL_ALERT_PERCENT", 3),
   dayAlertPercent: dayPctDefault,
   // 24H 回滞：触发用 dayAlertPercent，回落到 dayRearmPercent 内才允许再次触发
   dayRearmPercent: floatEnv("DAY_REARM_PERCENT", Math.max(0, dayPctDefault - 1)),
@@ -99,7 +91,7 @@ const lastPollChange = new Map(); // project -> 上一轮变化%
 const alertCooldown = new Map(); // `${project}:${type}` -> 时间戳
 const dayState = new Map(); // project -> 24H 区间状态：1 / 0 / -1（用于边沿触发）
 const subscriptions = new Map(); // key -> { chatId, threadId }；提醒会发到这些目标
-const knownUpcoming = new Map(); // name -> { startAt, canTrade, notifiedSoon }
+const mutedUpcoming = new Set(); // 已“停止提醒”的即将上市项目名
 
 function subKey(chatId, threadId) {
   return `${chatId}:${threadId == null ? "general" : threadId}`;
@@ -134,6 +126,7 @@ function saveState() {
       settings: Object.fromEntries(
         PERSISTED_SETTINGS.map((k) => [k, settings[k]]),
       ),
+      mutedUpcoming: [...mutedUpcoming],
     };
     const tmp = `${DATA_FILE}.tmp`;
     fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
@@ -162,7 +155,12 @@ function loadState() {
         if (s && s.chatId != null) addSubscription(s.chatId, s.threadId);
       }
     }
-    console.log(`[state] 已从 ${DATA_FILE} 恢复（订阅 ${subscriptions.size}）`);
+    if (data && Array.isArray(data.mutedUpcoming)) {
+      for (const n of data.mutedUpcoming) mutedUpcoming.add(String(n));
+    }
+    console.log(
+      `[state] 已从 ${DATA_FILE} 恢复（订阅 ${subscriptions.size}，静音 ${mutedUpcoming.size}）`,
+    );
   } catch (e) {
     console.error("[state] 读取失败:", e.message);
   }
@@ -364,13 +362,17 @@ function upcomingLine(u) {
   return parts.join("\n");
 }
 
-function upcomingDigest(list, title = "即将上市") {
-  const sorted = list
-    .slice()
-    .sort((a, b) => (a.startAt ?? Infinity) - (b.startAt ?? Infinity));
-  const lines = [`🆕 <b>${title} (${sorted.length})</b>`, ""];
-  for (const u of sorted) lines.push(upcomingLine(u), "");
-  return lines.join("\n").trim();
+// 即将上市卡片的「停止/恢复」按钮。callback_data 编码项目名
+function upcomingButton(name, muted) {
+  return {
+    inline_keyboard: [
+      [
+        muted
+          ? { text: "🔔 恢复提醒", callback_data: `uresume:${name}` }
+          : { text: "🛑 停止提醒", callback_data: `umute:${name}` },
+      ],
+    ],
+  };
 }
 
 function parseSnapshot(raw) {
@@ -758,70 +760,18 @@ async function pollLoop() {
   }
 }
 
-// 即将上市监控：首轮静默建基线；之后只在“新项目 / 即将开盘 / 已可交易”时提醒
-let firstUpcomingCycle = true;
-let lastDigestAt = 0; // 上次定时提示时间
-
+// 即将上市监控：每个周期对“未静音”的项目各发一张带「停止」按钮的卡片
 async function runUpcomingCycle() {
   if (subscriptions.size === 0) return;
   const list = await fetchUpcoming();
-  const now = Date.now();
-  const soonMs = LAUNCH_SOON_MIN * 60 * 1000;
-  const events = [];
+  const visible = list
+    .filter((u) => !mutedUpcoming.has(u.name))
+    .sort((a, b) => (a.startAt ?? Infinity) - (b.startAt ?? Infinity));
 
-  for (const u of list) {
-    const isSoon =
-      u.startAt != null && u.startAt - now > 0 && u.startAt - now <= soonMs;
-    const prev = knownUpcoming.get(u.name);
-
-    if (!prev) {
-      // 首次见到：建基线，不报（运行中新出现的才报）
-      if (!firstUpcomingCycle) {
-        const when = u.startAt != null
-          ? `\n开盘 ${fmtUTC(u.startAt)} UTC（${fmtCountdown(u.startAt - now)}）`
-          : "";
-        events.push(`🆕 <b>新预上市项目</b>：<b>${esc(u.name)}</b>${when}`);
-      }
-      knownUpcoming.set(u.name, {
-        startAt: u.startAt,
-        canTrade: u.canTrade,
-        notifiedSoon: isSoon, // 启动时已临近的不再单独提醒，避免重启刷屏
-      });
-      continue;
-    }
-
-    if (u.canTrade && !prev.canTrade) {
-      events.push(`🚀 <b>${esc(u.name)}</b> 已开盘，现在可以交易了！`);
-    }
-    if (isSoon && !prev.notifiedSoon) {
-      events.push(
-        `⏰ <b>${esc(u.name)}</b> 即将开盘（${fmtCountdown(u.startAt - now)}）\n开盘 ${fmtUTC(u.startAt)} UTC`,
-      );
-    }
-    knownUpcoming.set(u.name, {
-      startAt: u.startAt,
-      canTrade: u.canTrade,
-      notifiedSoon: prev.notifiedSoon || isSoon,
+  for (const u of visible) {
+    await broadcast(upcomingLine(u), {
+      reply_markup: upcomingButton(u.name, false),
     });
-  }
-
-  // 清理已离开 pre_launch 列表的项目（已上市/下架）
-  const names = new Set(list.map((u) => u.name));
-  for (const key of [...knownUpcoming.keys()]) {
-    if (!names.has(key)) knownUpcoming.delete(key);
-  }
-
-  firstUpcomingCycle = false;
-  for (const text of events) await broadcast(text);
-
-  // 每隔 UPCOMING_DIGEST_MIN 分钟自动提示一次当前即将上市列表
-  if (
-    UPCOMING_DIGEST_MIN > 0 &&
-    list.length > 0 &&
-    now - lastDigestAt >= UPCOMING_DIGEST_MIN * 60 * 1000
-  ) {
-    lastDigestAt = now;
-    await broadcast(upcomingDigest(list, "即将上市提醒"));
   }
 }
 
@@ -898,7 +848,7 @@ function statusText() {
     `冷却时间：${settings.cooldownMin}min（作用域 ${COOLDOWN_SCOPE}）`,
     `订阅目标：${subscriptions.size}`,
     `权限控制：${ADMIN_USER_IDS.size > 0 ? `仅 ${ADMIN_USER_IDS.size} 名管理员` : "开放"}`,
-    `预上市监控：${UPCOMING_ENABLED ? `每 ${UPCOMING_INTERVAL_SEC}s 检查` + (UPCOMING_DIGEST_MIN > 0 ? `，每 ${UPCOMING_DIGEST_MIN}min 定时提示` : "") : "关闭"}`,
+    `预上市提醒：${UPCOMING_ENABLED ? `每 ${UPCOMING_INTERVAL_SEC}s 一次（已静音 ${mutedUpcoming.size}）` : "关闭"}`,
     `项目数量：${PROJECTS.length}`,
   ].join("\n");
 }
@@ -931,7 +881,17 @@ async function cmdUpcoming(chatId, threadId) {
     await sendTelegram(chatId, "暂无即将上市的项目", threadExtra(threadId));
     return;
   }
-  await sendTelegram(chatId, upcomingDigest(list), threadExtra(threadId));
+  list.sort((a, b) => (a.startAt ?? Infinity) - (b.startAt ?? Infinity));
+  // 每个项目一张卡片，带「停止 / 恢复」按钮
+  for (const u of list) {
+    const muted = mutedUpcoming.has(u.name);
+    const text = (muted ? "🔕 " : "") + upcomingLine(u);
+    await sendTelegram(
+      chatId,
+      text,
+      threadExtra(threadId, { reply_markup: upcomingButton(u.name, muted) }),
+    );
+  }
 }
 
 async function cmdTop(chatId, threadId) {
@@ -1153,6 +1113,28 @@ async function handleCallback(cq) {
   if (chatId == null) return;
   const data = String(cq.data || "");
   if (!data) return;
+
+  // 即将上市卡片：停止/恢复某个项目的提醒
+  if (data.startsWith("umute:") || data.startsWith("uresume:")) {
+    if (!isAdminUser(cq.from && cq.from.id)) {
+      await sendTelegram(chatId, "❌ 无权限执行该命令", threadExtra(threadId));
+      return;
+    }
+    const mute = data.startsWith("umute:");
+    const name = data.slice(data.indexOf(":") + 1);
+    if (mute) mutedUpcoming.add(name);
+    else mutedUpcoming.delete(name);
+    saveState();
+    await sendTelegram(
+      chatId,
+      mute
+        ? `🔕 已停止「${esc(name)}」的上市提醒（在 /upcoming 里可恢复）`
+        : `🔔 已恢复「${esc(name)}」的上市提醒`,
+      threadExtra(threadId),
+    );
+    return;
+  }
+
   const cmdName = "/" + data;
   if (MUTATING_COMMANDS.has(cmdName) && !isAdminUser(cq.from && cq.from.id)) {
     await sendTelegram(chatId, "❌ 无权限执行该命令", threadExtra(threadId));
