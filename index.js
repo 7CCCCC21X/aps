@@ -266,9 +266,15 @@ function changeDot(p) {
   return p >= 0 ? "🟢" : "🔴";
 }
 
+// 整数计数（带千分位）：2080 -> 2,080
+function fmtCount(n) {
+  if (n == null || !isFinite(n)) return "N/A";
+  return Math.round(n).toLocaleString("en-US");
+}
+
 // 一个市场的两行卡片：
 //   🟢 <名称>  $价格  24H ±%
-//      1H ±% · 量 $… · 市值 $…   （次要信息，缺则省略）
+//      1H ±% · 成交 $… · 👥 …   （次要信息，缺则省略）
 function marketLine(it, extra = {}) {
   if (!it.ok) return `⚪️ <b>${esc(it.project)}</b>  无数据`;
   const head =
@@ -276,8 +282,8 @@ function marketLine(it, extra = {}) {
     `$${fmtPrice(it.price)}  24H ${fmtPct(it.change24h)}`;
   const tail = [];
   if (it.change1h != null) tail.push(`1H ${fmtPct(it.change1h)}`);
-  if (extra.volume != null) tail.push(`量 ${fmtUsd(extra.volume)}`);
-  if (extra.marketCap != null) tail.push(`市值 ${fmtUsd(extra.marketCap)}`);
+  if (extra.volume != null) tail.push(`成交 ${fmtUsd(extra.volume)}`);
+  if (extra.participants != null) tail.push(`👥 ${fmtCount(extra.participants)}`);
   return tail.length ? `${head}\n   <i>${tail.join(" · ")}</i>` : head;
 }
 
@@ -461,16 +467,12 @@ function findNumeric(obj, exactNorm, fallbackRe, excludeRe) {
   return null;
 }
 
-const MCAP_EXACT = [
-  "marketcap", "mktcap", "mcap", "fdv", "marketvalue",
-  "fullydilutedvaluation", "circulatingmarketcap", "marketcapusd",
-];
-const VOL_EXACT = [
-  "volume", "volume24h", "vol24h", "vol", "turnover",
-  "quotevolume", "tradingvolume", "volumeusd", "volume24husd",
-];
+// arena 接口没有“市值”，可用的规模字段是成交额/参与人数等（多为 1e18 定点的 USDT）：
+//   asset.total_volume 累计成交额 · asset.participants_count 参与人数
+const VOL_EXACT = ["totalvolume", "tradingvolume", "volumeusd", "volume"];
+const PART_EXACT = ["participantscount", "participants", "holderscount", "holders"];
 
-// 解析市场列表：name + 市值 + 成交量（字段名自动探测，取不到则为 null）
+// 解析市场列表：name + 累计成交额 + 参与人数（字段名探测，取不到则为 null）
 function parseArenaMarkets(raw) {
   const list = Array.isArray(raw)
     ? raw
@@ -483,8 +485,8 @@ function parseArenaMarkets(raw) {
     if (name == null) continue;
     out.push({
       name: String(name),
-      marketCap: findNumeric(item, MCAP_EXACT, /(market.?cap|mcap|fdv|valuation)/, /(rank|change|pct|percent|ratio)/),
-      volume: findNumeric(item, VOL_EXACT, /(volume|turnover)/, /(rank|change|pct|percent)/),
+      volume: findNumeric(item, VOL_EXACT, /total.*volume|trading.*volume/, /(asp|rank|change|pct|percent)/),
+      participants: findNumeric(item, PART_EXACT, /participant|holder/, /(rank|pct|percent)/),
     });
   }
   return out;
@@ -516,7 +518,7 @@ async function fetchActiveAssetNames(retries = 1) {
   return parseActiveAssets(await fetchArenaJson(retries));
 }
 
-// 拉取市场列表（含市值/成交量），用于按市值排序的全量播报
+// 拉取市场列表（含成交额/参与人数），用于按成交额排序的全量播报
 async function fetchArenaMarkets(retries = 1) {
   return parseArenaMarkets(await fetchArenaJson(retries));
 }
@@ -1233,13 +1235,13 @@ async function buildAllProjectsDigest() {
     }
     const rows = snap.map((it) => {
       const m = it.ok ? mcap.get(it.project) : null;
-      return { it, marketCap: m ? m.marketCap : null, volume: m ? m.volume : null };
+      return { it, volume: m ? m.volume : null, participants: m ? m.participants : null };
     });
 
-    // 优先按市值排序；接口无市值时退化为按成交量；都没有则按 24H 跌幅
+    // 按累计成交额排序；接口无成交额时退化为按参与人数；都没有则按 24H 跌幅
     let key, label;
-    if (rows.some((r) => r.marketCap != null)) { key = "marketCap"; label = "按市值"; }
-    else if (rows.some((r) => r.volume != null)) { key = "volume"; label = "按成交量"; }
+    if (rows.some((r) => r.volume != null)) { key = "volume"; label = "按成交额"; }
+    else if (rows.some((r) => r.participants != null)) { key = "participants"; label = "按参与数"; }
     else { key = null; label = "按 24H 跌幅"; }
     rows.sort((a, b) => {
       if (key) return (b[key] ?? -Infinity) - (a[key] ?? -Infinity);
@@ -1247,9 +1249,9 @@ async function buildAllProjectsDigest() {
     });
 
     lines.push("", `📈 <b>已上市 ${snap.length}</b> · ${label}`);
-    rows.forEach(({ it, marketCap, volume }, i) => {
+    rows.forEach(({ it, volume, participants }, i) => {
       const rank = it.ok ? `${i + 1}. ` : "";
-      lines.push(rank + marketLine(it, { marketCap, volume }));
+      lines.push(rank + marketLine(it, { volume, participants }));
     });
   } catch (e) {
     lines.push("", `📈 <b>已上市</b> 获取失败：${esc(e.message)}`);

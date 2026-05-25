@@ -106,27 +106,33 @@ test("fmtUsd：紧凑金额单位", () => {
   assert.strictEqual(fmtUsd(null), "N/A");
 });
 
-test("parseArenaMarkets：自动探测市值/成交量字段", () => {
+test("parseArenaMarkets：取累计成交额(asset.total_volume)与参与人数", () => {
   const r = parseArenaMarkets({
     data: [
-      { name: "AAA", market_cap: "50000000", volume_24h: "1200000" },
-      { symbol: "BBB", mcap: 8_000_000, turnover: 50_000 },
-      { asset: { name: "CCC" }, fdv: "3000000", volumeUsd: "9000" },
+      {
+        id: 1,
+        asset: { wallet_address: "Veera", total_volume: "415729019751566666011255", participants_count: 2080 },
+        recent_volume: "2961264169800000000000",
+      },
+      { id: 2, asset: { name: "GAEA", total_volume: "5000000000000000000000", participants_count: 120 } },
     ],
   });
-  assert.strictEqual(r.length, 3);
-  assert.deepStrictEqual(r[0], { name: "AAA", marketCap: 50000000, volume: 1200000 });
-  assert.deepStrictEqual(r[1], { name: "BBB", marketCap: 8000000, volume: 50000 });
-  assert.deepStrictEqual(r[2], { name: "CCC", marketCap: 3000000, volume: 9000 });
+  assert.strictEqual(r.length, 2);
+  assert.strictEqual(r[0].name, "Veera");
+  assert.ok(Math.abs(r[0].volume - 415729.02) < 1); // total_volume / 1e18
+  assert.strictEqual(r[0].participants, 2080);
+  assert.strictEqual(r[1].name, "GAEA");
+  assert.ok(Math.abs(r[1].volume - 5000) < 0.001);
+  assert.strictEqual(r[1].participants, 120);
 });
 
-test("parseArenaMarkets：忽略 rank/百分比类字段，取不到则 null", () => {
+test("parseArenaMarkets：忽略 asp/recent 等干扰字段，取不到则 null", () => {
   const r = parseArenaMarkets([
-    { name: "X", market_cap_rank: 3, price_change_24h: "0.1" },
+    { name: "X", total_asp_volume: "0", recent_volume: "100000000000000000000" },
   ]);
   assert.strictEqual(r[0].name, "X");
-  assert.strictEqual(r[0].marketCap, null);
-  assert.strictEqual(r[0].volume, null);
+  assert.strictEqual(r[0].volume, null); // total_asp_volume 排除、recent_volume 不计入
+  assert.strictEqual(r[0].participants, null);
 });
 
 test("parseArenaMarkets：空/异常输入返回空数组", () => {
