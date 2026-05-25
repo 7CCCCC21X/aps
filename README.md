@@ -15,6 +15,7 @@
 - **即将上市监控**：定时查 `assets-list` 的 pre_launch 组，每 `UPCOMING_INTERVAL_SEC`（默认 5 分钟）对每个项目发一张带「🛑 停止提醒」按钮的卡片；点停止即静音该项目（持久化保存），`/upcoming` 里可恢复
 - **临开盘特别提醒**：倒计时进入 `LAUNCH_SOON_MIN`（默认 30 分钟）后改发「🔥 即将开盘」特别提醒，每 `LAUNCH_ALERT_INTERVAL_MIN`（默认 10 分钟）一次
 - **开盘后接入价格**：项目开盘后自动加入价格监控，推送一条带最新价的「🚀 已开盘」通知，之后价格异动照常推送
+- **自动刷新监控列表**：定时（`REFRESH_INTERVAL_MIN`，默认 30 分钟）从 `arena-popular-assets` 同步当前活跃项目，把不在固定列表里的新项目自动纳入监控（解决「写死 18 个项目导致新币漏监控」）；也可发 `/refresh` 手动同步
 - Telegram 命令交互：查询、排行、订阅话题、暂停/恢复、运行时改阈值
 - `/health` 接口（Node 内置 http，零依赖），供 Railway 健康检查与保活
 
@@ -45,7 +46,8 @@
 | `UPCOMING_INTERVAL_SEC` | 否 | `300` | 即将上市普通提示间隔（秒，最小 60） |
 | `LAUNCH_SOON_MIN` | 否 | `30` | 倒计时进入此窗口（分钟）后改发临开盘特别提醒 |
 | `LAUNCH_ALERT_INTERVAL_MIN` | 否 | `10` | 临开盘特别提醒的间隔（分钟） |
-| `TRADING_CONFIG_ID` | 否 | `1` | assets-list 的交易配置 id |
+| `REFRESH_INTERVAL_MIN` | 否 | `30` | 自动同步监控列表的间隔（分钟），0=关闭 |
+| `TRADING_CONFIG_ID` | 否 | `1` | assets-list / arena 的交易配置 id |
 | `ASPECTA_COOKIE` | 否 | — | 若接口返回 401/403，填登录后的 Cookie |
 | `PORT` | 否 | `3000` | HTTP 端口（Railway 自动注入） |
 
@@ -99,6 +101,7 @@
 | `/now` | 立即查询全部项目 |
 | `/top` | 查看 24H 涨跌排行 |
 | `/upcoming` | 查看即将上市（pre-launch）项目 |
+| `/refresh` | 刷新监控列表（同步当前活跃项目） |
 | `/detail GAEA` | 查看单个项目 |
 | `/subscribe` | 把提醒订阅到当前话题 |
 | `/unsubscribe` | 取消当前话题的订阅 |

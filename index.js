@@ -27,6 +27,7 @@ const PROJECTS = [
 
 const ASPECTA_API = "https://trade.aspecta.ai/api/hermes/trading/k-line";
 const ASSETS_API = "https://trade.aspecta.ai/api/hermes/trading/assets-list";
+const ARENA_API = "https://trade.aspecta.ai/api/hermes/trading/arena-popular-assets";
 
 // ── 配置（环境变量 + 运行时可改）────────────────────────────────
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
@@ -69,6 +70,11 @@ const LAUNCH_SOON_MIN = (() => {
 const LAUNCH_ALERT_INTERVAL_MIN = (() => {
   const v = parseInt(process.env.LAUNCH_ALERT_INTERVAL_MIN, 10);
   return Number.isFinite(v) && v >= 1 ? v : 10;
+})();
+// 自动从 arena-popular-assets 同步监控列表的间隔（分钟）。0 = 关闭自动刷新（仍可用 /refresh）
+const REFRESH_INTERVAL_MIN = (() => {
+  const v = parseInt(process.env.REFRESH_INTERVAL_MIN, 10);
+  return Number.isFinite(v) && v >= 0 ? v : 30;
 })();
 
 function intEnv(name, def, min) {
@@ -290,6 +296,15 @@ async function fetchSnapshotCached(maxAgeMs = 15000) {
 
 // ── 即将上市（pre_launch）项目 ──────────────────────────────────
 // 返回字段名不确定，按多个候选名取值，取不到则降级。
+const NAME_FIELDS = [
+  "name",
+  "symbol",
+  "display_name",
+  "project_name",
+  "project_address",
+  "wallet_address",
+];
+
 function pickField(obj, names) {
   for (const n of names) {
     if (obj && obj[n] != null) return obj[n];
@@ -305,14 +320,7 @@ function parseUpcoming(raw) {
       ? raw.data
       : [];
   return list.map((item) => {
-    const name = pickField(item, [
-      "name",
-      "symbol",
-      "display_name",
-      "project_name",
-      "project_address",
-      "wallet_address",
-    ]);
+    const name = pickField(item, NAME_FIELDS);
     const startRaw = pickField(item, [
       "trade_start_time",
       "trading_start_time",
@@ -359,6 +367,57 @@ async function fetchUpcoming(retries = 1) {
     }
   }
   throw lastErr;
+}
+
+// 从 arena-popular-assets 解析出当前活跃项目名
+function parseActiveAssets(raw) {
+  const list = Array.isArray(raw)
+    ? raw
+    : raw && Array.isArray(raw.data)
+      ? raw.data
+      : [];
+  const names = [];
+  for (const item of list) {
+    const n = pickField(item, NAME_FIELDS);
+    if (n != null) names.push(String(n));
+  }
+  return names;
+}
+
+async function fetchActiveAssetNames(retries = 1) {
+  const url = new URL(ARENA_API);
+  url.searchParams.set("trading_config_id", TRADING_CONFIG_ID);
+  url.searchParams.set("order_by", "-price_change_24h");
+
+  const headers = { accept: "application/json" };
+  if (process.env.ASPECTA_COOKIE) headers.cookie = process.env.ASPECTA_COOKIE;
+
+  let lastErr;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const res = await fetch(url, { headers, signal: AbortSignal.timeout(20000) });
+      if (!res.ok) throw new Error(`arena-popular-assets ${res.status} ${res.statusText}`);
+      return parseActiveAssets(await res.json());
+    } catch (e) {
+      lastErr = e;
+      if (attempt < retries) await sleep(1000 * (attempt + 1));
+    }
+  }
+  throw lastErr;
+}
+
+// 同步监控列表：把活跃项目里不在监控范围的加入 dynamicProjects
+async function refreshProjects() {
+  const names = await fetchActiveAssetNames();
+  const added = [];
+  for (const n of names) {
+    if (!n || PROJECTS.includes(n) || dynamicProjects.has(n)) continue;
+    dynamicProjects.add(n);
+    added.push(n);
+  }
+  if (added.length) saveState();
+  snapshotCache = { ts: 0, data: null, promise: null }; // 强制下次重新拉取
+  return { added, source: names.length, total: monitoredProjects().length };
 }
 
 function fmtUTC(ms) {
@@ -588,6 +647,7 @@ async function registerCommands() {
     { command: "now", description: "立即查询全部项目" },
     { command: "top", description: "24H 涨跌排行" },
     { command: "upcoming", description: "即将上市（pre-launch）项目" },
+    { command: "refresh", description: "刷新监控列表（同步当前活跃项目）" },
     { command: "detail", description: "查看单个项目，如 /detail GAEA" },
     { command: "subscribe", description: "把提醒订阅到当前话题" },
     { command: "unsubscribe", description: "取消当前话题的订阅" },
@@ -892,6 +952,29 @@ async function upcomingLoop() {
   }
 }
 
+// 定时从 arena-popular-assets 同步监控列表，自动纳入新上线/更新的项目
+async function refreshLoop() {
+  if (REFRESH_INTERVAL_MIN <= 0) {
+    console.log("[refresh] 自动刷新已禁用（仍可用 /refresh）");
+    return;
+  }
+  let first = true; // 首次只静默建立基线，避免一次性播报一大堆
+  while (true) {
+    try {
+      const r = await refreshProjects();
+      if (!first && r.added.length && subscriptions.size > 0) {
+        await broadcast(
+          `🔄 新增价格监控（${r.added.length}）：${r.added.map(esc).join("、")}`,
+        );
+      }
+      first = false;
+    } catch (e) {
+      console.error("[refresh] 出错:", e.message);
+    }
+    await sleep(REFRESH_INTERVAL_MIN * 60 * 1000);
+  }
+}
+
 // ── Telegram 命令（long polling）────────────────────────────────
 // 点击式菜单（inline keyboard）。callback_data 直接复用命令名
 const MENU_KEYBOARD = {
@@ -902,8 +985,9 @@ const MENU_KEYBOARD = {
     ],
     [
       { text: "🆕 即将上市", callback_data: "upcoming" },
-      { text: "⚙️ 当前配置", callback_data: "status" },
+      { text: "🔄 刷新列表", callback_data: "refresh" },
     ],
+    [{ text: "⚙️ 当前配置", callback_data: "status" }],
     [
       { text: "📌 订阅本话题", callback_data: "subscribe" },
       { text: "🚫 取消订阅", callback_data: "unsubscribe" },
@@ -923,6 +1007,7 @@ const HELP_TEXT = [
   "/now - 立即查询全部项目",
   "/top - 24H 涨跌排行",
   "/upcoming - 即将上市（pre-launch）项目",
+  "/refresh - 刷新监控列表（同步当前活跃项目）",
   "/detail &lt;项目&gt; - 查看单个项目，如 /detail GAEA",
   "/subscribe - 把提醒订阅到当前话题",
   "/unsubscribe - 取消当前话题的订阅",
@@ -1055,6 +1140,7 @@ async function cmdDetail(chatId, threadId, name) {
 const MUTATING_COMMANDS = new Set([
   "/subscribe",
   "/unsubscribe",
+  "/refresh",
   "/pause",
   "/resume",
   "/set_interval",
@@ -1094,6 +1180,22 @@ async function handleCommand(chatId, threadId, cmd, args) {
     case "/upcoming":
       await cmdUpcoming(chatId, threadId);
       break;
+    case "/refresh": {
+      let r;
+      try {
+        r = await refreshProjects();
+      } catch (e) {
+        await reply(`❌ 刷新失败：${esc(e.message)}`);
+        break;
+      }
+      await reply(
+        `🔄 已刷新（活跃项目 ${r.source} 个）\n监控项目：${r.total} 个\n` +
+          (r.added.length
+            ? `新增：${r.added.map(esc).join("、")}`
+            : "无新增"),
+      );
+      break;
+    }
     case "/detail":
       await cmdDetail(chatId, threadId, args[0]);
       break;
@@ -1405,6 +1507,7 @@ function main() {
   telegramPollLoop();
   pollLoop(); // 首轮会发送“当前异动快照”，无需在此单独发启动消息
   upcomingLoop(); // 即将上市监控
+  refreshLoop(); // 定时同步监控列表
 }
 
 if (require.main === module) {
@@ -1420,6 +1523,7 @@ module.exports = {
   esc,
   parseSnapshot,
   parseUpcoming,
+  parseActiveAssets,
   isSoon,
   isLaunched,
   monitoredProjects,

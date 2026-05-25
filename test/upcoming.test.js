@@ -2,7 +2,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert");
-const { parseUpcoming, isSoon, isLaunched } = require("../index.js");
+const { parseUpcoming, isSoon, isLaunched, parseActiveAssets } = require("../index.js");
 
 test("parseUpcoming：解析 {data:[...]} 与标准字段", () => {
   const r = parseUpcoming({
@@ -65,4 +65,19 @@ test("isLaunched：可交易或开盘时间已过为真", () => {
   assert.strictEqual(isLaunched({ canTrade: false, startAt: now - 1 }, now), true);
   assert.strictEqual(isLaunched({ canTrade: false, startAt: now + 60000 }, now), false);
   assert.strictEqual(isLaunched({ canTrade: false, startAt: null }, now), false);
+});
+
+test("parseActiveAssets：从数组/嵌套 asset 取出项目名", () => {
+  const names = parseActiveAssets([
+    { asset: { name: "GAEA" }, price_change_24h: "0.05" },
+    { name: "NEWCOIN", price_change_24h: "0.1" },
+    { symbol: "ABC" },
+    { foo: "bar" }, // 取不到名字 -> 跳过
+  ]);
+  assert.deepStrictEqual(names, ["GAEA", "NEWCOIN", "ABC"]);
+});
+
+test("parseActiveAssets：空/异常输入返回空数组", () => {
+  assert.deepStrictEqual(parseActiveAssets(null), []);
+  assert.deepStrictEqual(parseActiveAssets({}), []);
 });
