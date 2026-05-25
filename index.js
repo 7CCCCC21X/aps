@@ -1221,6 +1221,10 @@ const CFG_FIELDS = {
     label: "24H阈值", unit: "%", step: 0.5, min: 0.5, max: 100,
     get: () => settings.dayAlertPercent, set: (v) => (settings.dayAlertPercent = v),
   },
+  rearm: {
+    label: "24H回滞", unit: "%", step: 0.5, min: 0, max: 100,
+    get: () => settings.dayRearmPercent, set: (v) => (settings.dayRearmPercent = v),
+  },
   cooldown: {
     label: "冷却", unit: "min", step: 5, min: 0, max: 1440,
     get: () => settings.cooldownMin, set: (v) => (settings.cooldownMin = v),
@@ -1259,6 +1263,7 @@ function settingsCard() {
       row("interval"),
       row("lookback"),
       row("day"),
+      row("rearm"),
       row("cooldown"),
       [{ text: "🔙 返回菜单", callback_data: "menu" }],
     ],
