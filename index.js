@@ -260,6 +260,27 @@ function fmtUsd(n) {
   return `$${n.toFixed(0)}`;
 }
 
+// 涨跌指示点：绿涨 / 红跌 / 灰无数据
+function changeDot(p) {
+  if (p == null || !isFinite(p)) return "⚪️";
+  return p >= 0 ? "🟢" : "🔴";
+}
+
+// 一个市场的两行卡片：
+//   🟢 <名称>  $价格  24H ±%
+//      1H ±% · 量 $… · 市值 $…   （次要信息，缺则省略）
+function marketLine(it, extra = {}) {
+  if (!it.ok) return `⚪️ <b>${esc(it.project)}</b>  无数据`;
+  const head =
+    `${changeDot(it.change24h)} <b>${esc(it.project)}</b>  ` +
+    `$${fmtPrice(it.price)}  24H ${fmtPct(it.change24h)}`;
+  const tail = [];
+  if (it.change1h != null) tail.push(`1H ${fmtPct(it.change1h)}`);
+  if (extra.volume != null) tail.push(`量 ${fmtUsd(extra.volume)}`);
+  if (extra.marketCap != null) tail.push(`市值 ${fmtUsd(extra.marketCap)}`);
+  return tail.length ? `${head}\n   <i>${tail.join(" · ")}</i>` : head;
+}
+
 function esc(s) {
   return String(s)
     .replace(/&/g, "&amp;")
@@ -542,13 +563,15 @@ function upcomingLine(u) {
 
 // 全量播报里即将上市的紧凑单行
 function upcomingDigestLine(u) {
-  let when = "";
+  const tradable = u.canTrade ? " ✅" : "";
   if (u.startAt != null) {
-    when = ` — 开盘 ${fmtUTC(u.startAt)} UTC（${fmtCountdown(u.startAt - Date.now())}）`;
-  } else if (u.startRaw) {
-    when = ` — 开盘 ${esc(u.startRaw)}`;
+    return (
+      `⏳ <b>${esc(u.name)}</b>  ${fmtCountdown(u.startAt - Date.now())}${tradable}\n` +
+      `   <i>开盘 ${fmtUTC(u.startAt)} UTC</i>`
+    );
   }
-  return `🆕 <b>${esc(u.name)}</b>${when}${u.canTrade ? " ✅" : ""}`;
+  if (u.startRaw) return `⏳ <b>${esc(u.name)}</b>  <i>开盘 ${esc(u.startRaw)}</i>${tradable}`;
+  return `⏳ <b>${esc(u.name)}</b>${tradable}`;
 }
 
 // 按行切分成 ≤max 字符的多条消息，避免超过 Telegram 4096 限制
@@ -1191,23 +1214,14 @@ function statusText() {
 
 async function cmdNow(chatId, threadId) {
   const snap = await fetchSnapshotCached();
-  const lines = ["📊 <b>Aspecta 全部项目</b>"];
-  for (const it of snap) {
-    if (!it.ok) {
-      lines.push(`<b>${esc(it.project)}</b>  无数据`);
-      continue;
-    }
-    lines.push(
-      `<b>${esc(it.project)}</b>  $${fmtPrice(it.price)}  ` +
-        `1H ${fmtPct(it.change1h)}  24H ${fmtPct(it.change24h)}`,
-    );
-  }
+  const lines = ["📊 <b>已上市行情</b>"];
+  for (const it of snap) lines.push(marketLine(it));
   await sendTelegram(chatId, lines.join("\n"), threadExtra(threadId));
 }
 
-// 全量播报：已上市（带价格）+ 即将上市（pre_launch），切分成多条避免超长
+// 全量播报：已上市（带价格/市值）+ 即将上市（pre_launch），切分成多条避免超长
 async function buildAllProjectsDigest() {
-  const lines = ["📋 <b>全部项目</b>"];
+  const lines = ["📋 <b>全部市场</b>"];
 
   try {
     const snap = await fetchSnapshotCached();
@@ -1221,31 +1235,34 @@ async function buildAllProjectsDigest() {
       const m = it.ok ? mcap.get(it.project) : null;
       return { it, marketCap: m ? m.marketCap : null, volume: m ? m.volume : null };
     });
-    // 按市值降序，取不到市值的排最后
-    rows.sort((a, b) => (b.marketCap ?? -Infinity) - (a.marketCap ?? -Infinity));
-    lines.push("", `<b>— 已上市 (${snap.length}) · 按市值 —</b>`);
-    for (const { it, marketCap, volume } of rows) {
-      if (!it.ok) {
-        lines.push(`<b>${esc(it.project)}</b>  无数据`);
-        continue;
-      }
-      let line = `<b>${esc(it.project)}</b>  $${fmtPrice(it.price)}  市值 ${fmtUsd(marketCap)}`;
-      if (volume != null) line += `  量 ${fmtUsd(volume)}`;
-      line += `  1H ${fmtPct(it.change1h)}  24H ${fmtPct(it.change24h)}`;
-      lines.push(line);
-    }
+
+    // 优先按市值排序；接口无市值时退化为按成交量；都没有则按 24H 跌幅
+    let key, label;
+    if (rows.some((r) => r.marketCap != null)) { key = "marketCap"; label = "按市值"; }
+    else if (rows.some((r) => r.volume != null)) { key = "volume"; label = "按成交量"; }
+    else { key = null; label = "按 24H 跌幅"; }
+    rows.sort((a, b) => {
+      if (key) return (b[key] ?? -Infinity) - (a[key] ?? -Infinity);
+      return (a.it.change24h ?? Infinity) - (b.it.change24h ?? Infinity);
+    });
+
+    lines.push("", `📈 <b>已上市 ${snap.length}</b> · ${label}`);
+    rows.forEach(({ it, marketCap, volume }, i) => {
+      const rank = it.ok ? `${i + 1}. ` : "";
+      lines.push(rank + marketLine(it, { marketCap, volume }));
+    });
   } catch (e) {
-    lines.push("", `<b>— 已上市 —</b> 获取失败：${esc(e.message)}`);
+    lines.push("", `📈 <b>已上市</b> 获取失败：${esc(e.message)}`);
   }
 
   try {
     const up = await fetchUpcoming();
     up.sort((a, b) => (a.startAt ?? Infinity) - (b.startAt ?? Infinity));
-    lines.push("", `<b>— 即将上市 (${up.length}) —</b>`);
+    lines.push("", `🆕 <b>即将上市 ${up.length}</b>`);
     if (up.length === 0) lines.push("（暂无）");
     for (const u of up) lines.push(upcomingDigestLine(u));
   } catch (e) {
-    lines.push("", `<b>— 即将上市 —</b> 获取失败：${esc(e.message)}`);
+    lines.push("", `🆕 <b>即将上市</b> 获取失败：${esc(e.message)}`);
   }
 
   return chunkLines(lines);
@@ -1254,6 +1271,34 @@ async function buildAllProjectsDigest() {
 async function cmdAll(chatId, threadId) {
   const chunks = await buildAllProjectsDigest();
   for (const text of chunks) await sendTelegram(chatId, text, threadExtra(threadId));
+}
+
+// 隐藏排查命令：打印 arena 接口首条记录的字段名+值，用于确认“市值”字段的真实名字
+async function cmdDebugArena(chatId, threadId) {
+  let raw;
+  try {
+    raw = await fetchArenaJson();
+  } catch (e) {
+    await sendTelegram(chatId, `❌ 拉取失败：${esc(e.message)}`, threadExtra(threadId));
+    return;
+  }
+  const list = Array.isArray(raw) ? raw : raw && Array.isArray(raw.data) ? raw.data : [];
+  const item = list[0];
+  if (!item) {
+    await sendTelegram(chatId, "arena 返回空列表", threadExtra(threadId));
+    return;
+  }
+  const lines = ["🔧 <b>arena 首条字段</b>"];
+  for (const [k, v] of Object.entries(item)) {
+    if (v && typeof v === "object" && !Array.isArray(v)) {
+      for (const [k2, v2] of Object.entries(v)) {
+        lines.push(`<code>${esc(`${k}.${k2}`)}</code> = ${esc(String(v2)).slice(0, 48)}`);
+      }
+    } else if (!Array.isArray(v)) {
+      lines.push(`<code>${esc(k)}</code> = ${esc(String(v)).slice(0, 48)}`);
+    }
+  }
+  await sendTelegram(chatId, lines.join("\n"), threadExtra(threadId));
 }
 
 async function cmdUpcoming(chatId, threadId) {
@@ -1289,7 +1334,8 @@ async function cmdTop(chatId, threadId) {
   const lines = ["🏆 <b>24H 涨跌排行</b>"];
   snap.forEach((it, i) => {
     lines.push(
-      `${i + 1}. <b>${esc(it.project)}</b>  ${fmtPct(it.change24h)}  ($${fmtPrice(it.price)})`,
+      `${i + 1}. ${changeDot(it.change24h)} <b>${esc(it.project)}</b>  ` +
+        `${fmtPct(it.change24h)}  ·  $${fmtPrice(it.price)}`,
     );
   });
   await sendTelegram(chatId, lines.join("\n"), threadExtra(threadId));
@@ -1349,6 +1395,7 @@ const MUTATING_COMMANDS = new Set([
   "/set_rearm",
   "/set_cooldown",
   "/set_lookback",
+  "/debug_arena",
 ]);
 
 function isAdminUser(userId) {
@@ -1376,6 +1423,9 @@ async function handleCommand(chatId, threadId, cmd, args) {
       break;
     case "/all":
       await cmdAll(chatId, threadId);
+      break;
+    case "/debug_arena":
+      await cmdDebugArena(chatId, threadId);
       break;
     case "/top":
       await cmdTop(chatId, threadId);
