@@ -93,14 +93,14 @@ function floatEnv(name, def) {
 
 const dayPctDefault = floatEnv("DAY_ALERT_PERCENT", 5);
 const settings = {
-  pollIntervalSec: intEnv("POLL_INTERVAL_SEC", 60, 10),
+  pollIntervalSec: intEnv("POLL_INTERVAL_SEC", 20, 10),
   pollAlertPercent: floatEnv("POLL_ALERT_PERCENT", 3),
   dayAlertPercent: dayPctDefault,
   // 24H 回滞：触发用 dayAlertPercent，回落到 dayRearmPercent 内才允许再次触发
   dayRearmPercent: floatEnv("DAY_REARM_PERCENT", Math.max(0, dayPctDefault - 1)),
   cooldownMin: intEnv("ALERT_COOLDOWN_MIN", 30, 0),
   // 本轮变化的回看窗口（秒）。0 = 对比上一次轮询；>0 = 对比约 N 秒前的价格
-  pollLookbackSec: intEnv("POLL_LOOKBACK_SEC", 0, 0),
+  pollLookbackSec: intEnv("POLL_LOOKBACK_SEC", 60, 0),
   paused: false,
 };
 

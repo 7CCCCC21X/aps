@@ -8,7 +8,7 @@
 
 - 定时（默认 60s）请求 Aspecta `k-line` 接口，解析 18 个固定项目
 - 计算 **本轮变化**（两次查询之间，可选回看窗口）、**1H 变化**、**24H 变化**
-- 本轮波动超过 `POLL_ALERT_PERCENT`（默认 3%，只报突然的大波动）时推送提醒
+- 默认「**60 秒内涨跌 ≥3%**」才推送（`POLL_LOOKBACK_SEC=60` 窗口 + `POLL_ALERT_PERCENT=3` 阈值），每 20 秒重叠检查一次，只抓突发拉砸
 - **24H 边沿触发**：只有 24H 涨跌从阈值内**穿越**到 `DAY_ALERT_PERCENT` 之外时才报，避免持续偏离时反复刷屏
 - **冷启动静默**：启动/重启后第一轮只建立基线、发一条「当前异动快照」，不会把所有已超阈值的项目一次性轰炸出来
 - **合并推送**：同一轮里多个项目触发时合并成一条消息，并带 🟢/🔴 涨跌图标
@@ -33,13 +33,13 @@
 | --- | --- | --- | --- |
 | `TELEGRAM_BOT_TOKEN` | 是 | — | 找 @BotFather 创建机器人得到的 Token |
 | `TELEGRAM_CHAT_ID` | 否 | — | 默认订阅的 chat_id（重启后自动恢复；也可只用 `/subscribe`） |
-| `POLL_INTERVAL_SEC` | 否 | `60` | 查询间隔（秒），最小 10 |
-| `POLL_ALERT_PERCENT` | 否 | `3` | 本轮变化提醒阈值（%，只报突然的大波动） |
+| `POLL_INTERVAL_SEC` | 否 | `20` | 查询间隔（秒），最小 10 |
+| `POLL_ALERT_PERCENT` | 否 | `3` | 本轮变化提醒阈值（%，配合下方窗口） |
 | `DAY_ALERT_PERCENT` | 否 | `5` | 24H 变化提醒阈值（%，边沿触发） |
 | `DAY_REARM_PERCENT` | 否 | `阈值-1` | 24H 回滞阈值，回落到此值内才允许再次触发 |
 | `ALERT_COOLDOWN_MIN` | 否 | `30` | 同项目提醒冷却（分钟） |
 | `COOLDOWN_SCOPE` | 否 | `project` | 冷却作用域：`project`=同项目共用；`type`=本轮/24H 各自独立 |
-| `POLL_LOOKBACK_SEC` | 否 | `0` | 本轮变化回看窗口（秒），0=对比上一次轮询 |
+| `POLL_LOOKBACK_SEC` | 否 | `60` | 本轮变化回看窗口（秒），0=对比上一次轮询 |
 | `TELEGRAM_TOPIC_ID` | 否 | — | 群组话题(forum topic) id，作为默认订阅的话题 |
 | `TELEGRAM_ADMIN_USER_IDS` | 否 | — | 有权改阈值/订阅/暂停的用户 id（逗号分隔）；留空=开放 |
 | `DATA_FILE` | 否 | `./data.json` | 持久化文件路径，指向 Railway Volume 可跨重新部署保留 |
