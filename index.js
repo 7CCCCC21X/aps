@@ -74,7 +74,12 @@ const LAUNCH_ALERT_INTERVAL_MIN = (() => {
 // 自动从 arena-popular-assets 同步监控列表的间隔（分钟）。0 = 关闭自动刷新（仍可用 /refresh）
 const REFRESH_INTERVAL_MIN = (() => {
   const v = parseInt(process.env.REFRESH_INTERVAL_MIN, 10);
-  return Number.isFinite(v) && v >= 0 ? v : 30;
+  return Number.isFinite(v) && v >= 0 ? v : 10;
+})();
+// 每隔多少分钟播报一次“全部项目”（已上市+即将上市）。0 = 关闭
+const DIGEST_INTERVAL_MIN = (() => {
+  const v = parseInt(process.env.DIGEST_INTERVAL_MIN, 10);
+  return Number.isFinite(v) && v >= 0 ? v : 60;
 })();
 
 function intEnv(name, def, min) {
@@ -446,6 +451,32 @@ function upcomingLine(u) {
   return parts.join("\n");
 }
 
+// 全量播报里即将上市的紧凑单行
+function upcomingDigestLine(u) {
+  let when = "";
+  if (u.startAt != null) {
+    when = ` — 开盘 ${fmtUTC(u.startAt)} UTC（${fmtCountdown(u.startAt - Date.now())}）`;
+  } else if (u.startRaw) {
+    when = ` — 开盘 ${esc(u.startRaw)}`;
+  }
+  return `🆕 <b>${esc(u.name)}</b>${when}${u.canTrade ? " ✅" : ""}`;
+}
+
+// 按行切分成 ≤max 字符的多条消息，避免超过 Telegram 4096 限制
+function chunkLines(lines, max = 3900) {
+  const chunks = [];
+  let cur = "";
+  for (const ln of lines) {
+    if (cur && cur.length + ln.length + 1 > max) {
+      chunks.push(cur);
+      cur = "";
+    }
+    cur = cur ? `${cur}\n${ln}` : ln;
+  }
+  if (cur) chunks.push(cur);
+  return chunks;
+}
+
 // 即将上市卡片的「停止/恢复」按钮。callback_data 编码项目名
 function upcomingButton(name, muted) {
   return {
@@ -645,6 +676,7 @@ async function registerCommands() {
   const commands = [
     { command: "menu", description: "打开功能菜单" },
     { command: "now", description: "立即查询全部项目" },
+    { command: "all", description: "全部项目（已上市+即将上市）" },
     { command: "top", description: "24H 涨跌排行" },
     { command: "upcoming", description: "即将上市（pre-launch）项目" },
     { command: "refresh", description: "刷新监控列表（同步当前活跃项目）" },
@@ -975,19 +1007,40 @@ async function refreshLoop() {
   }
 }
 
+// 定时播报“全部项目”（已上市 + 即将上市）
+async function digestLoop() {
+  if (DIGEST_INTERVAL_MIN <= 0) {
+    console.log("[digest] 全量播报已禁用（仍可用 /all）");
+    return;
+  }
+  while (true) {
+    await sleep(DIGEST_INTERVAL_MIN * 60 * 1000); // 先等一个周期，避免和启动快照重叠
+    try {
+      if (subscriptions.size === 0) continue;
+      const chunks = await buildAllProjectsDigest();
+      for (const text of chunks) await broadcast(text);
+    } catch (e) {
+      console.error("[digest] 出错:", e.message);
+    }
+  }
+}
+
 // ── Telegram 命令（long polling）────────────────────────────────
 // 点击式菜单（inline keyboard）。callback_data 直接复用命令名
 const MENU_KEYBOARD = {
   inline_keyboard: [
     [
-      { text: "📊 全部项目", callback_data: "now" },
+      { text: "📊 已上市行情", callback_data: "now" },
       { text: "🏆 涨跌排行", callback_data: "top" },
     ],
     [
+      { text: "📋 全部项目", callback_data: "all" },
       { text: "🆕 即将上市", callback_data: "upcoming" },
-      { text: "🔄 刷新列表", callback_data: "refresh" },
     ],
-    [{ text: "⚙️ 当前配置", callback_data: "status" }],
+    [
+      { text: "🔄 刷新列表", callback_data: "refresh" },
+      { text: "⚙️ 当前配置", callback_data: "status" },
+    ],
     [
       { text: "📌 订阅本话题", callback_data: "subscribe" },
       { text: "🚫 取消订阅", callback_data: "unsubscribe" },
@@ -1005,6 +1058,7 @@ const HELP_TEXT = [
   "",
   "/menu - 打开功能菜单",
   "/now - 立即查询全部项目",
+  "/all - 全部项目（已上市+即将上市）",
   "/top - 24H 涨跌排行",
   "/upcoming - 即将上市（pre-launch）项目",
   "/refresh - 刷新监控列表（同步当前活跃项目）",
@@ -1037,6 +1091,7 @@ function statusText() {
     `权限控制：${ADMIN_USER_IDS.size > 0 ? `仅 ${ADMIN_USER_IDS.size} 名管理员` : "开放"}`,
     `预上市提醒：${UPCOMING_ENABLED ? `每 ${UPCOMING_INTERVAL_SEC}s 一次，临开盘 ${LAUNCH_SOON_MIN}min 内每 ${LAUNCH_ALERT_INTERVAL_MIN}min 特别提醒（已静音 ${mutedUpcoming.size}）` : "关闭"}`,
     `监控项目：${PROJECTS.length} 固定 + ${dynamicProjects.size} 动态`,
+    `自动刷新：${REFRESH_INTERVAL_MIN > 0 ? `每 ${REFRESH_INTERVAL_MIN}min` : "关闭"}　全量播报：${DIGEST_INTERVAL_MIN > 0 ? `每 ${DIGEST_INTERVAL_MIN}min` : "关闭"}`,
   ].join("\n");
 }
 
@@ -1054,6 +1109,45 @@ async function cmdNow(chatId, threadId) {
     );
   }
   await sendTelegram(chatId, lines.join("\n"), threadExtra(threadId));
+}
+
+// 全量播报：已上市（带价格）+ 即将上市（pre_launch），切分成多条避免超长
+async function buildAllProjectsDigest() {
+  const lines = ["📋 <b>全部项目</b>"];
+
+  try {
+    const snap = await fetchSnapshotCached();
+    lines.push("", `<b>— 已上市 (${snap.length}) —</b>`);
+    for (const it of snap) {
+      if (!it.ok) {
+        lines.push(`<b>${esc(it.project)}</b>  无数据`);
+        continue;
+      }
+      lines.push(
+        `<b>${esc(it.project)}</b>  $${fmtPrice(it.price)}  ` +
+          `1H ${fmtPct(it.change1h)}  24H ${fmtPct(it.change24h)}`,
+      );
+    }
+  } catch (e) {
+    lines.push("", `<b>— 已上市 —</b> 获取失败：${esc(e.message)}`);
+  }
+
+  try {
+    const up = await fetchUpcoming();
+    up.sort((a, b) => (a.startAt ?? Infinity) - (b.startAt ?? Infinity));
+    lines.push("", `<b>— 即将上市 (${up.length}) —</b>`);
+    if (up.length === 0) lines.push("（暂无）");
+    for (const u of up) lines.push(upcomingDigestLine(u));
+  } catch (e) {
+    lines.push("", `<b>— 即将上市 —</b> 获取失败：${esc(e.message)}`);
+  }
+
+  return chunkLines(lines);
+}
+
+async function cmdAll(chatId, threadId) {
+  const chunks = await buildAllProjectsDigest();
+  for (const text of chunks) await sendTelegram(chatId, text, threadExtra(threadId));
 }
 
 async function cmdUpcoming(chatId, threadId) {
@@ -1173,6 +1267,9 @@ async function handleCommand(chatId, threadId, cmd, args) {
       break;
     case "/now":
       await cmdNow(chatId, threadId);
+      break;
+    case "/all":
+      await cmdAll(chatId, threadId);
       break;
     case "/top":
       await cmdTop(chatId, threadId);
@@ -1508,6 +1605,7 @@ function main() {
   pollLoop(); // 首轮会发送“当前异动快照”，无需在此单独发启动消息
   upcomingLoop(); // 即将上市监控
   refreshLoop(); // 定时同步监控列表
+  digestLoop(); // 定时全量播报
 }
 
 if (require.main === module) {
