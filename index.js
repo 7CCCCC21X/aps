@@ -61,15 +61,15 @@ const UPCOMING_INTERVAL_SEC = (() => {
   const v = parseInt(process.env.UPCOMING_INTERVAL_SEC, 10);
   return Number.isFinite(v) && v >= 60 ? v : 300;
 })();
-// 临开盘特别提醒：倒计时进入此窗口（分钟）后改发特别提醒
+// 临开盘特别提醒：倒计时进入此窗口（分钟）后才开始反复提醒（默认 30 = 开盘前半小时）
 const LAUNCH_SOON_MIN = (() => {
   const v = parseInt(process.env.LAUNCH_SOON_MIN, 10);
   return Number.isFinite(v) && v >= 1 ? v : 30;
 })();
-// 特别提醒的间隔（分钟）
+// 临开盘窗口内的提醒间隔（分钟，默认 5 = 每 5 分钟一次）
 const LAUNCH_ALERT_INTERVAL_MIN = (() => {
   const v = parseInt(process.env.LAUNCH_ALERT_INTERVAL_MIN, 10);
-  return Number.isFinite(v) && v >= 1 ? v : 10;
+  return Number.isFinite(v) && v >= 1 ? v : 5;
 })();
 // 自动从 arena-popular-assets 同步监控列表的间隔（分钟）。0 = 关闭自动刷新（仍可用 /refresh）
 const REFRESH_INTERVAL_MIN = (() => {
@@ -116,6 +116,7 @@ const mutedUpcoming = new Set(); // 已“停止提醒”的即将上市项目�
 const dynamicProjects = new Set(); // 上线后动态加入价格监控的项目名
 const upcomingStartAt = new Map(); // name -> startAt（记住开盘时间，用于判断是否已开盘）
 const lastSoonAlertAt = new Map(); // name -> 上次特别提醒时间
+const announcedUpcoming = new Set(); // 已“首次公告”过的即将上市项目名（远期项目只播一次）
 
 // 价格监控的项目 = 固定列表 + 上线后动态加入的
 function monitoredProjects() {
@@ -236,6 +237,27 @@ function fmtPrice(p) {
 function fmtPct(x) {
   if (x == null || !isFinite(x)) return "N/A";
   return `${x >= 0 ? "+" : ""}${x.toFixed(2)}%`;
+}
+
+// 解析可能是普通数字、数字字符串、或 1e18 定点整数的数值
+function toNum(value) {
+  if (value == null) return null;
+  if (typeof value === "number") return isFinite(value) ? value : null;
+  const s = String(value).trim();
+  if (s === "") return null;
+  if (/^-?\d{19,}$/.test(s)) return toPrice(s); // 超长纯整数按 1e18 定点处理
+  const n = Number(s);
+  return isFinite(n) ? n : null;
+}
+
+// 紧凑的美元金额：$1.23B / $45.6M / $789K / $42
+function fmtUsd(n) {
+  if (n == null || !isFinite(n)) return "N/A";
+  const a = Math.abs(n);
+  if (a >= 1e9) return `$${(n / 1e9).toFixed(2)}B`;
+  if (a >= 1e6) return `$${(n / 1e6).toFixed(2)}M`;
+  if (a >= 1e3) return `$${(n / 1e3).toFixed(1)}K`;
+  return `$${n.toFixed(0)}`;
 }
 
 function esc(s) {
@@ -389,7 +411,65 @@ function parseActiveAssets(raw) {
   return names;
 }
 
-async function fetchActiveAssetNames(retries = 1) {
+// 接口字段名不确定：先用归一化后的候选名精确匹配，再用正则兜底（排除 rank/百分比类）
+function normKey(k) {
+  return String(k).toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+function findNumeric(obj, exactNorm, fallbackRe, excludeRe) {
+  const sources = [obj, obj && obj.asset].filter((x) => x && typeof x === "object");
+  for (const want of exactNorm) {
+    for (const src of sources) {
+      for (const k of Object.keys(src)) {
+        if (normKey(k) === want) {
+          const v = toNum(src[k]);
+          if (v != null) return v;
+        }
+      }
+    }
+  }
+  for (const src of sources) {
+    for (const k of Object.keys(src)) {
+      const nk = normKey(k);
+      if (excludeRe.test(nk)) continue;
+      if (fallbackRe.test(nk)) {
+        const v = toNum(src[k]);
+        if (v != null) return v;
+      }
+    }
+  }
+  return null;
+}
+
+const MCAP_EXACT = [
+  "marketcap", "mktcap", "mcap", "fdv", "marketvalue",
+  "fullydilutedvaluation", "circulatingmarketcap", "marketcapusd",
+];
+const VOL_EXACT = [
+  "volume", "volume24h", "vol24h", "vol", "turnover",
+  "quotevolume", "tradingvolume", "volumeusd", "volume24husd",
+];
+
+// 解析市场列表：name + 市值 + 成交量（字段名自动探测，取不到则为 null）
+function parseArenaMarkets(raw) {
+  const list = Array.isArray(raw)
+    ? raw
+    : raw && Array.isArray(raw.data)
+      ? raw.data
+      : [];
+  const out = [];
+  for (const item of list) {
+    const name = pickField(item, NAME_FIELDS);
+    if (name == null) continue;
+    out.push({
+      name: String(name),
+      marketCap: findNumeric(item, MCAP_EXACT, /(market.?cap|mcap|fdv|valuation)/, /(rank|change|pct|percent|ratio)/),
+      volume: findNumeric(item, VOL_EXACT, /(volume|turnover)/, /(rank|change|pct|percent)/),
+    });
+  }
+  return out;
+}
+
+async function fetchArenaJson(retries = 1) {
   const url = new URL(ARENA_API);
   url.searchParams.set("trading_config_id", TRADING_CONFIG_ID);
   url.searchParams.set("order_by", "-price_change_24h");
@@ -402,13 +482,22 @@ async function fetchActiveAssetNames(retries = 1) {
     try {
       const res = await fetch(url, { headers, signal: AbortSignal.timeout(20000) });
       if (!res.ok) throw new Error(`arena-popular-assets ${res.status} ${res.statusText}`);
-      return parseActiveAssets(await res.json());
+      return await res.json();
     } catch (e) {
       lastErr = e;
       if (attempt < retries) await sleep(1000 * (attempt + 1));
     }
   }
   throw lastErr;
+}
+
+async function fetchActiveAssetNames(retries = 1) {
+  return parseActiveAssets(await fetchArenaJson(retries));
+}
+
+// 拉取市场列表（含市值/成交量），用于按市值排序的全量播报
+async function fetchArenaMarkets(retries = 1) {
+  return parseArenaMarkets(await fetchArenaJson(retries));
 }
 
 // 同步监控列表：把活跃项目里不在监控范围的加入 dynamicProjects
@@ -916,8 +1005,8 @@ async function handleLaunch(name) {
 }
 
 // 即将上市监控：
-// - 临开盘（倒计时≤LAUNCH_SOON_MIN）改发特别提醒，每 LAUNCH_ALERT_INTERVAL_MIN 一次
-// - 其余未静音项目发普通卡片
+// - 远期项目（倒计时>LAUNCH_SOON_MIN）只在首次发现时公告一次，不每轮刷屏
+// - 开盘前 LAUNCH_SOON_MIN 内每 LAUNCH_ALERT_INTERVAL_MIN 发一次特别提醒
 // - 开盘后加入价格监控并推送一次
 async function runUpcomingCycle() {
   if (subscriptions.size === 0) return;
@@ -942,10 +1031,11 @@ async function runUpcomingCycle() {
     if (mutedUpcoming.has(u.name)) continue;
 
     if (isSoon(u, now, soonMs)) {
-      // 临开盘特别提醒，按 LAUNCH_ALERT_INTERVAL_MIN 节流（抑制普通卡片）
+      // 开盘前半小时内：每 LAUNCH_ALERT_INTERVAL_MIN 反复发特别提醒
       const last = lastSoonAlertAt.get(u.name) || 0;
       if (now - last >= soonIntervalMs) {
         lastSoonAlertAt.set(u.name, now);
+        announcedUpcoming.add(u.name);
         await broadcast(soonCard(u, now), {
           reply_markup: upcomingButton(u.name, false),
         });
@@ -953,10 +1043,13 @@ async function runUpcomingCycle() {
       continue;
     }
 
-    // 普通卡片
-    await broadcast(upcomingLine(u), {
-      reply_markup: upcomingButton(u.name, false),
-    });
+    // 还远未开盘（>半小时）：只在首次发现时公告一次，避免每轮刷屏
+    if (!announcedUpcoming.has(u.name)) {
+      announcedUpcoming.add(u.name);
+      await broadcast(upcomingLine(u), {
+        reply_markup: upcomingButton(u.name, false),
+      });
+    }
   }
 
   // 已离开 pre_launch 列表、且开盘时间已过的，视为已开盘
@@ -965,6 +1058,7 @@ async function runUpcomingCycle() {
       if (startAt != null && now >= startAt) await handleLaunch(name);
       upcomingStartAt.delete(name);
       lastSoonAlertAt.delete(name);
+      announcedUpcoming.delete(name);
     }
   }
 }
@@ -1089,7 +1183,7 @@ function statusText() {
     `冷却时间：${settings.cooldownMin}min（作用域 ${COOLDOWN_SCOPE}）`,
     `订阅目标：${subscriptions.size}`,
     `权限控制：${ADMIN_USER_IDS.size > 0 ? `仅 ${ADMIN_USER_IDS.size} 名管理员` : "开放"}`,
-    `预上市提醒：${UPCOMING_ENABLED ? `每 ${UPCOMING_INTERVAL_SEC}s 一次，临开盘 ${LAUNCH_SOON_MIN}min 内每 ${LAUNCH_ALERT_INTERVAL_MIN}min 特别提醒（已静音 ${mutedUpcoming.size}）` : "关闭"}`,
+    `预上市提醒：${UPCOMING_ENABLED ? `新项目仅公告一次，开盘前 ${LAUNCH_SOON_MIN}min 起每 ${LAUNCH_ALERT_INTERVAL_MIN}min 提醒一次（已静音 ${mutedUpcoming.size}）` : "关闭"}`,
     `监控项目：${PROJECTS.length} 固定 + ${dynamicProjects.size} 动态`,
     `自动刷新：${REFRESH_INTERVAL_MIN > 0 ? `每 ${REFRESH_INTERVAL_MIN}min` : "关闭"}　全量播报：${DIGEST_INTERVAL_MIN > 0 ? `每 ${DIGEST_INTERVAL_MIN}min` : "关闭"}`,
   ].join("\n");
@@ -1117,16 +1211,28 @@ async function buildAllProjectsDigest() {
 
   try {
     const snap = await fetchSnapshotCached();
-    lines.push("", `<b>— 已上市 (${snap.length}) —</b>`);
-    for (const it of snap) {
+    const mcap = new Map();
+    try {
+      for (const m of await fetchArenaMarkets()) mcap.set(m.name, m);
+    } catch (e) {
+      console.error("[digest] 市值获取失败:", e.message);
+    }
+    const rows = snap.map((it) => {
+      const m = it.ok ? mcap.get(it.project) : null;
+      return { it, marketCap: m ? m.marketCap : null, volume: m ? m.volume : null };
+    });
+    // 按市值降序，取不到市值的排最后
+    rows.sort((a, b) => (b.marketCap ?? -Infinity) - (a.marketCap ?? -Infinity));
+    lines.push("", `<b>— 已上市 (${snap.length}) · 按市值 —</b>`);
+    for (const { it, marketCap, volume } of rows) {
       if (!it.ok) {
         lines.push(`<b>${esc(it.project)}</b>  无数据`);
         continue;
       }
-      lines.push(
-        `<b>${esc(it.project)}</b>  $${fmtPrice(it.price)}  ` +
-          `1H ${fmtPct(it.change1h)}  24H ${fmtPct(it.change24h)}`,
-      );
+      let line = `<b>${esc(it.project)}</b>  $${fmtPrice(it.price)}  市值 ${fmtUsd(marketCap)}`;
+      if (volume != null) line += `  量 ${fmtUsd(volume)}`;
+      line += `  1H ${fmtPct(it.change1h)}  24H ${fmtPct(it.change24h)}`;
+      lines.push(line);
     }
   } catch (e) {
     lines.push("", `<b>— 已上市 —</b> 获取失败：${esc(e.message)}`);
@@ -1622,6 +1728,9 @@ module.exports = {
   parseSnapshot,
   parseUpcoming,
   parseActiveAssets,
+  parseArenaMarkets,
+  toNum,
+  fmtUsd,
   isSoon,
   isLaunched,
   monitoredProjects,

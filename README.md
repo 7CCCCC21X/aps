@@ -12,11 +12,11 @@
 - **24H 边沿触发**：只有 24H 涨跌从阈值内**穿越**到 `DAY_ALERT_PERCENT` 之外时才报，避免持续偏离时反复刷屏
 - **冷启动静默**：启动/重启后第一轮只建立基线、发一条「当前异动快照」，不会把所有已超阈值的项目一次性轰炸出来
 - **合并推送**：同一轮里多个项目触发时合并成一条消息，并带 🟢/🔴 涨跌图标
-- **即将上市监控**：定时查 `assets-list` 的 pre_launch 组，每 `UPCOMING_INTERVAL_SEC`（默认 5 分钟）对每个项目发一张带「🛑 停止提醒」按钮的卡片；点停止即静音该项目（持久化保存），`/upcoming` 里可恢复
-- **临开盘特别提醒**：倒计时进入 `LAUNCH_SOON_MIN`（默认 30 分钟）后改发「🔥 即将开盘」特别提醒，每 `LAUNCH_ALERT_INTERVAL_MIN`（默认 10 分钟）一次
+- **即将上市监控**：定时查 `assets-list` 的 pre_launch 组（每 `UPCOMING_INTERVAL_SEC` 轮询一次）。**远期新项目只在首次发现时公告一次**，不会每轮刷屏；卡片带「🛑 停止提醒」按钮，点停止即静音该项目（持久化保存），`/upcoming` 里可恢复
+- **临开盘特别提醒**：开盘前 `LAUNCH_SOON_MIN`（默认 30 分钟）内才开始反复提醒，发「🔥 即将开盘」卡片，每 `LAUNCH_ALERT_INTERVAL_MIN`（默认 5 分钟）一次
 - **开盘后接入价格**：项目开盘后自动加入价格监控，推送一条带最新价的「🚀 已开盘」通知，之后价格异动照常推送
 - **自动刷新监控列表**：定时（`REFRESH_INTERVAL_MIN`，默认 10 分钟）从 `arena-popular-assets` 同步当前活跃项目，把不在固定列表里的新项目自动纳入监控（解决「写死 18 个项目导致新币漏监控」）；也可发 `/refresh` 手动同步
-- **全量播报**：定时（`DIGEST_INTERVAL_MIN`，默认 60 分钟）把「全部项目」发一次，含已上市（价格/1H/24H）与即将上市（pre-launch）；也可发 `/all` 手动查看
+- **全量播报**：定时（`DIGEST_INTERVAL_MIN`，默认 60 分钟）把「全部项目」发一次。已上市部分**按市值从高到低排序**，每行含价格、市值、成交量、1H/24H（市值/成交量取自 `arena-popular-assets`，字段名自动探测，取不到则显示 N/A）；并附即将上市（pre-launch）列表。也可发 `/all` 手动查看
 - Telegram 命令交互：查询、排行、订阅话题、暂停/恢复、运行时改阈值
 - `/health` 接口（Node 内置 http，零依赖），供 Railway 健康检查与保活
 
@@ -44,9 +44,9 @@
 | `TELEGRAM_ADMIN_USER_IDS` | 否 | — | 有权改阈值/订阅/暂停的用户 id（逗号分隔）；留空=开放 |
 | `DATA_FILE` | 否 | `./data.json` | 持久化文件路径，指向 Railway Volume 可跨重新部署保留 |
 | `UPCOMING_ENABLED` | 否 | `true` | 是否监控即将上市（pre_launch）项目 |
-| `UPCOMING_INTERVAL_SEC` | 否 | `300` | 即将上市普通提示间隔（秒，最小 60） |
-| `LAUNCH_SOON_MIN` | 否 | `30` | 倒计时进入此窗口（分钟）后改发临开盘特别提醒 |
-| `LAUNCH_ALERT_INTERVAL_MIN` | 否 | `10` | 临开盘特别提醒的间隔（分钟） |
+| `UPCOMING_INTERVAL_SEC` | 否 | `300` | 轮询 pre_launch 列表的间隔（秒，最小 60）；远期新项目只公告一次 |
+| `LAUNCH_SOON_MIN` | 否 | `30` | 开盘前这么多分钟内才开始反复提醒 |
+| `LAUNCH_ALERT_INTERVAL_MIN` | 否 | `5` | 临开盘窗口内的提醒间隔（分钟） |
 | `REFRESH_INTERVAL_MIN` | 否 | `10` | 自动同步监控列表的间隔（分钟），0=关闭 |
 | `DIGEST_INTERVAL_MIN` | 否 | `60` | 全量播报间隔（分钟），0=关闭 |
 | `TRADING_CONFIG_ID` | 否 | `1` | assets-list / arena 的交易配置 id |
@@ -102,7 +102,7 @@
 | `/id` | 查看当前 chat_id / topic_id |
 | `/now` | 立即查询全部项目 |
 | `/top` | 查看 24H 涨跌排行 |
-| `/all` | 全部项目（已上市 + 即将上市） |
+| `/all` | 全部项目（已上市按市值排序 + 即将上市） |
 | `/upcoming` | 查看即将上市（pre-launch）项目 |
 | `/refresh` | 刷新监控列表（同步当前活跃项目） |
 | `/detail GAEA` | 查看单个项目 |
