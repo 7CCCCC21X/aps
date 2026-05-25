@@ -60,6 +60,16 @@ const UPCOMING_INTERVAL_SEC = (() => {
   const v = parseInt(process.env.UPCOMING_INTERVAL_SEC, 10);
   return Number.isFinite(v) && v >= 60 ? v : 300;
 })();
+// 临开盘特别提醒：倒计时进入此窗口（分钟）后改发特别提醒
+const LAUNCH_SOON_MIN = (() => {
+  const v = parseInt(process.env.LAUNCH_SOON_MIN, 10);
+  return Number.isFinite(v) && v >= 1 ? v : 30;
+})();
+// 特别提醒的间隔（分钟）
+const LAUNCH_ALERT_INTERVAL_MIN = (() => {
+  const v = parseInt(process.env.LAUNCH_ALERT_INTERVAL_MIN, 10);
+  return Number.isFinite(v) && v >= 1 ? v : 10;
+})();
 
 function intEnv(name, def, min) {
   const v = parseInt(process.env[name], 10);
@@ -92,6 +102,16 @@ const alertCooldown = new Map(); // `${project}:${type}` -> 时间戳
 const dayState = new Map(); // project -> 24H 区间状态：1 / 0 / -1（用于边沿触发）
 const subscriptions = new Map(); // key -> { chatId, threadId }；提醒会发到这些目标
 const mutedUpcoming = new Set(); // 已“停止提醒”的即将上市项目名
+const dynamicProjects = new Set(); // 上线后动态加入价格监控的项目名
+const upcomingStartAt = new Map(); // name -> startAt（记住开盘时间，用于判断是否已开盘）
+const lastSoonAlertAt = new Map(); // name -> 上次特别提醒时间
+
+// 价格监控的项目 = 固定列表 + 上线后动态加入的
+function monitoredProjects() {
+  const set = new Set(PROJECTS);
+  for (const p of dynamicProjects) set.add(p);
+  return [...set];
+}
 
 function subKey(chatId, threadId) {
   return `${chatId}:${threadId == null ? "general" : threadId}`;
@@ -127,6 +147,7 @@ function saveState() {
         PERSISTED_SETTINGS.map((k) => [k, settings[k]]),
       ),
       mutedUpcoming: [...mutedUpcoming],
+      dynamicProjects: [...dynamicProjects],
     };
     const tmp = `${DATA_FILE}.tmp`;
     fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
@@ -158,8 +179,11 @@ function loadState() {
     if (data && Array.isArray(data.mutedUpcoming)) {
       for (const n of data.mutedUpcoming) mutedUpcoming.add(String(n));
     }
+    if (data && Array.isArray(data.dynamicProjects)) {
+      for (const n of data.dynamicProjects) dynamicProjects.add(String(n));
+    }
     console.log(
-      `[state] 已从 ${DATA_FILE} 恢复（订阅 ${subscriptions.size}，静音 ${mutedUpcoming.size}）`,
+      `[state] 已从 ${DATA_FILE} 恢复（订阅 ${subscriptions.size}，静音 ${mutedUpcoming.size}，动态监控 ${dynamicProjects.size}）`,
     );
   } catch (e) {
     console.error("[state] 读取失败:", e.message);
@@ -220,10 +244,11 @@ function threadExtra(threadId, extra = {}) {
 
 // ── 2 & 3. 请求接口并解析 K 线 ──────────────────────────────────
 async function fetchSnapshot(retries = 1) {
+  const projects = monitoredProjects();
   const url = new URL(ASPECTA_API);
-  url.searchParams.set("project_address", PROJECTS.join(","));
-  url.searchParams.set("offset", PROJECTS.map(() => "24").join(","));
-  url.searchParams.set("window_type", PROJECTS.map(() => "1h").join(","));
+  url.searchParams.set("project_address", projects.join(","));
+  url.searchParams.set("offset", projects.map(() => "24").join(","));
+  url.searchParams.set("window_type", projects.map(() => "1h").join(","));
 
   const headers = { accept: "application/json" };
   if (process.env.ASPECTA_COOKIE) headers.cookie = process.env.ASPECTA_COOKIE;
@@ -373,6 +398,25 @@ function upcomingButton(name, muted) {
       ],
     ],
   };
+}
+
+// 是否处于“临开盘”窗口（还没开盘，且倒计时进入 soonMs 内）
+function isSoon(u, now, soonMs) {
+  return u.startAt != null && u.startAt - now > 0 && u.startAt - now <= soonMs;
+}
+
+// 是否已开盘：可交易，或开盘时间已过
+function isLaunched(u, now) {
+  return u.canTrade === true || (u.startAt != null && now >= u.startAt);
+}
+
+// 临开盘特别提醒卡片
+function soonCard(u, now) {
+  return [
+    `🔥 <b>${esc(u.name)} 即将开盘！</b>`,
+    `⏰ ${fmtCountdown(u.startAt - now)}`,
+    `开盘 ${fmtUTC(u.startAt)} UTC`,
+  ].join("\n");
 }
 
 function parseSnapshot(raw) {
@@ -760,18 +804,76 @@ async function pollLoop() {
   }
 }
 
-// 即将上市监控：每个周期对“未静音”的项目各发一张带「停止」按钮的卡片
+// 某个项目上线：加入价格监控，并推送一条带最新价的「已开盘」通知（只发一次）
+async function handleLaunch(name) {
+  if (dynamicProjects.has(name)) return;
+  dynamicProjects.add(name);
+  saveState();
+  let priceStr = "";
+  try {
+    const snap = await fetchSnapshot(); // 现在已包含该项目
+    snapshotCache = { ts: Date.now(), data: snap, promise: null };
+    const it = snap.find((x) => x.ok && x.project === name);
+    if (it) priceStr = `\n最新价 $${fmtPrice(it.price)}  24H ${fmtPct(it.change24h)}`;
+  } catch {
+    /* 取价失败不影响通知 */
+  }
+  await broadcast(
+    `🚀 <b>${esc(name)} 已开盘！</b>已加入价格监控${priceStr}`,
+  );
+}
+
+// 即将上市监控：
+// - 临开盘（倒计时≤LAUNCH_SOON_MIN）改发特别提醒，每 LAUNCH_ALERT_INTERVAL_MIN 一次
+// - 其余未静音项目发普通卡片
+// - 开盘后加入价格监控并推送一次
 async function runUpcomingCycle() {
   if (subscriptions.size === 0) return;
   const list = await fetchUpcoming();
+  const now = Date.now();
+  const soonMs = LAUNCH_SOON_MIN * 60 * 1000;
+  const soonIntervalMs = LAUNCH_ALERT_INTERVAL_MIN * 60 * 1000;
+  const currentNames = new Set();
+
   const visible = list
-    .filter((u) => !mutedUpcoming.has(u.name))
+    .slice()
     .sort((a, b) => (a.startAt ?? Infinity) - (b.startAt ?? Infinity));
 
   for (const u of visible) {
+    currentNames.add(u.name);
+    if (u.startAt != null) upcomingStartAt.set(u.name, u.startAt);
+
+    if (isLaunched(u, now)) {
+      await handleLaunch(u.name);
+      continue; // 已开盘的不再发上市提醒
+    }
+    if (mutedUpcoming.has(u.name)) continue;
+
+    if (isSoon(u, now, soonMs)) {
+      // 临开盘特别提醒，按 LAUNCH_ALERT_INTERVAL_MIN 节流（抑制普通卡片）
+      const last = lastSoonAlertAt.get(u.name) || 0;
+      if (now - last >= soonIntervalMs) {
+        lastSoonAlertAt.set(u.name, now);
+        await broadcast(soonCard(u, now), {
+          reply_markup: upcomingButton(u.name, false),
+        });
+      }
+      continue;
+    }
+
+    // 普通卡片
     await broadcast(upcomingLine(u), {
       reply_markup: upcomingButton(u.name, false),
     });
+  }
+
+  // 已离开 pre_launch 列表、且开盘时间已过的，视为已开盘
+  for (const [name, startAt] of [...upcomingStartAt]) {
+    if (!currentNames.has(name)) {
+      if (startAt != null && now >= startAt) await handleLaunch(name);
+      upcomingStartAt.delete(name);
+      lastSoonAlertAt.delete(name);
+    }
   }
 }
 
@@ -848,8 +950,8 @@ function statusText() {
     `冷却时间：${settings.cooldownMin}min（作用域 ${COOLDOWN_SCOPE}）`,
     `订阅目标：${subscriptions.size}`,
     `权限控制：${ADMIN_USER_IDS.size > 0 ? `仅 ${ADMIN_USER_IDS.size} 名管理员` : "开放"}`,
-    `预上市提醒：${UPCOMING_ENABLED ? `每 ${UPCOMING_INTERVAL_SEC}s 一次（已静音 ${mutedUpcoming.size}）` : "关闭"}`,
-    `项目数量：${PROJECTS.length}`,
+    `预上市提醒：${UPCOMING_ENABLED ? `每 ${UPCOMING_INTERVAL_SEC}s 一次，临开盘 ${LAUNCH_SOON_MIN}min 内每 ${LAUNCH_ALERT_INTERVAL_MIN}min 特别提醒（已静音 ${mutedUpcoming.size}）` : "关闭"}`,
+    `监控项目：${PROJECTS.length} 固定 + ${dynamicProjects.size} 动态`,
   ].join("\n");
 }
 
@@ -1264,7 +1366,7 @@ function startServer() {
           status: "ok",
           paused: settings.paused,
           pollIntervalSec: settings.pollIntervalSec,
-          projects: PROJECTS.length,
+          projects: monitoredProjects().length,
           tracked: priceHistory.size,
           subscriptions: subscriptions.size,
           uptimeSec: Math.round(process.uptime()),
@@ -1318,6 +1420,9 @@ module.exports = {
   esc,
   parseSnapshot,
   parseUpcoming,
+  isSoon,
+  isLaunched,
+  monitoredProjects,
   getPollChange,
   canAlertKey,
   evalDayAlert,

@@ -2,7 +2,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert");
-const { parseUpcoming } = require("../index.js");
+const { parseUpcoming, isSoon, isLaunched } = require("../index.js");
 
 test("parseUpcoming：解析 {data:[...]} 与标准字段", () => {
   const r = parseUpcoming({
@@ -48,4 +48,21 @@ test("parseUpcoming：空/异常输入返回空数组", () => {
   assert.deepStrictEqual(parseUpcoming(null), []);
   assert.deepStrictEqual(parseUpcoming({}), []);
   assert.deepStrictEqual(parseUpcoming([]), []);
+});
+
+test("isSoon：倒计时进入窗口内（未开盘）才为真", () => {
+  const now = 1_000_000_000_000;
+  const soonMs = 30 * 60 * 1000;
+  assert.strictEqual(isSoon({ startAt: now + 20 * 60000 }, now, soonMs), true);
+  assert.strictEqual(isSoon({ startAt: now + 40 * 60000 }, now, soonMs), false); // 还太早
+  assert.strictEqual(isSoon({ startAt: now - 60000 }, now, soonMs), false); // 已过开盘
+  assert.strictEqual(isSoon({ startAt: null }, now, soonMs), false);
+});
+
+test("isLaunched：可交易或开盘时间已过为真", () => {
+  const now = 1_000_000_000_000;
+  assert.strictEqual(isLaunched({ canTrade: true, startAt: now + 99999 }, now), true);
+  assert.strictEqual(isLaunched({ canTrade: false, startAt: now - 1 }, now), true);
+  assert.strictEqual(isLaunched({ canTrade: false, startAt: now + 60000 }, now), false);
+  assert.strictEqual(isLaunched({ canTrade: false, startAt: null }, now), false);
 });
