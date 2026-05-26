@@ -76,11 +76,16 @@ const REFRESH_INTERVAL_MIN = (() => {
   const v = parseInt(process.env.REFRESH_INTERVAL_MIN, 10);
   return Number.isFinite(v) && v >= 0 ? v : 10;
 })();
-// 每隔多少分钟播报一次“全部项目”（已上市+即将上市）。0 = 关闭
-const DIGEST_INTERVAL_MIN = (() => {
-  const v = parseInt(process.env.DIGEST_INTERVAL_MIN, 10);
-  return Number.isFinite(v) && v >= 0 ? v : 60;
-})();
+// 全量播报：每天北京时间固定时刻发一次（默认 12:00）。DIGEST_ENABLED=false 关闭
+const DIGEST_ENABLED = process.env.DIGEST_ENABLED !== "false";
+const CN_OFFSET_MIN = 8 * 60; // 北京时间 = UTC+8（中国无夏令时）
+const DIGEST_HOUR_CN = clampIntEnv("DIGEST_HOUR_CN", 12, 0, 23);
+const DIGEST_MINUTE_CN = clampIntEnv("DIGEST_MINUTE_CN", 0, 0, 59);
+
+function clampIntEnv(name, def, lo, hi) {
+  const v = parseInt(process.env[name], 10);
+  return Number.isFinite(v) && v >= lo && v <= hi ? v : def;
+}
 
 function intEnv(name, def, min) {
   const v = parseInt(process.env[name], 10);
@@ -1154,14 +1159,26 @@ async function refreshLoop() {
   }
 }
 
-// 定时播报“全部项目”（已上市 + 即将上市）
+// 距离“下一个北京时间 HH:MM”的毫秒数；用 1s 缓冲避免定时器早触发导致重复播报
+function msUntilNextDigest(now = Date.now()) {
+  const off = CN_OFFSET_MIN * 60000;
+  const cn = new Date(now + off); // 用 UTC 字段表示北京墙上时间
+  cn.setUTCHours(DIGEST_HOUR_CN, DIGEST_MINUTE_CN, 0, 0);
+  let targetMs = cn.getTime() - off; // 换回真实 UTC 时间戳
+  if (targetMs <= now + 1000) targetMs += 24 * 3600 * 1000;
+  return targetMs - now;
+}
+
+// 每天北京时间固定时刻播报“全部市场”（已上市 + 即将上市）
 async function digestLoop() {
-  if (DIGEST_INTERVAL_MIN <= 0) {
-    console.log("[digest] 全量播报已禁用（仍可用 /all）");
+  if (!DIGEST_ENABLED) {
+    console.log("[digest] 每日全量播报已禁用（仍可用 /all）");
     return;
   }
+  const at = `${String(DIGEST_HOUR_CN).padStart(2, "0")}:${String(DIGEST_MINUTE_CN).padStart(2, "0")}`;
+  console.log(`[digest] 每天北京时间 ${at} 播报全部市场`);
   while (true) {
-    await sleep(DIGEST_INTERVAL_MIN * 60 * 1000); // 先等一个周期，避免和启动快照重叠
+    await sleep(msUntilNextDigest());
     try {
       if (subscriptions.size === 0) continue;
       const chunks = await buildAllProjectsDigest();
@@ -1310,7 +1327,7 @@ function statusText() {
     `权限控制：${ADMIN_USER_IDS.size > 0 ? `仅 ${ADMIN_USER_IDS.size} 名管理员` : "开放"}`,
     `预上市提醒：${UPCOMING_ENABLED ? `新项目仅公告一次，开盘前 ${LAUNCH_SOON_MIN}min 起每 ${LAUNCH_ALERT_INTERVAL_MIN}min 提醒一次（已静音 ${mutedUpcoming.size}）` : "关闭"}`,
     `监控项目：${PROJECTS.length} 固定 + ${dynamicProjects.size} 动态`,
-    `自动刷新：${REFRESH_INTERVAL_MIN > 0 ? `每 ${REFRESH_INTERVAL_MIN}min` : "关闭"}　全量播报：${DIGEST_INTERVAL_MIN > 0 ? `每 ${DIGEST_INTERVAL_MIN}min` : "关闭"}`,
+    `自动刷新：${REFRESH_INTERVAL_MIN > 0 ? `每 ${REFRESH_INTERVAL_MIN}min` : "关闭"}　全量播报：${DIGEST_ENABLED ? `每天 ${String(DIGEST_HOUR_CN).padStart(2, "0")}:${String(DIGEST_MINUTE_CN).padStart(2, "0")}（北京）` : "关闭"}`,
   ].join("\n");
 }
 

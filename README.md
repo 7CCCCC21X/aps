@@ -16,7 +16,7 @@
 - **临开盘特别提醒**：开盘前 `LAUNCH_SOON_MIN`（默认 30 分钟）内才开始反复提醒，发「🔥 即将开盘」卡片，每 `LAUNCH_ALERT_INTERVAL_MIN`（默认 5 分钟）一次
 - **开盘后接入价格**：项目开盘后自动加入价格监控，推送一条带最新价的「🚀 已开盘」通知，之后价格异动照常推送
 - **自动刷新监控列表**：定时（`REFRESH_INTERVAL_MIN`，默认 10 分钟）从 `arena-popular-assets` 同步当前活跃项目，把不在固定列表里的新项目自动纳入监控（解决「写死 18 个项目导致新币漏监控」）；也可发 `/refresh` 手动同步
-- **全量播报**：定时（`DIGEST_INTERVAL_MIN`，默认 60 分钟）把「全部市场」发一次。已上市部分按**近期成交额**从高到低排序，卡片式展示价格、24H/1H、成交额、参与人数（成交额/人数取自 `arena-popular-assets` 的 `recent_volume` / `participants_count`；该接口为预发币做空盘，无市值字段，故用成交额作为规模排序）；并附即将上市（pre-launch）列表。也可发 `/all` 手动查看
+- **全量播报**：每天**北京时间 12:00**（可配 `DIGEST_HOUR_CN`/`DIGEST_MINUTE_CN`）把「全部市场」发一次。已上市部分按**近期成交额**从高到低排序，卡片式展示价格、24H/1H、成交额、参与人数（成交额/人数取自 `arena-popular-assets` 的 `recent_volume` / `participants_count`；该接口为预发币做空盘，无市值字段，故用成交额作为规模排序）；并附即将上市（pre-launch）列表。也可发 `/all` 手动查看
 - **设置卡片**：`/settings`（或菜单里「⚙️ 设置」）打开可点按调整的卡片，用 ➖/➕ 直接改本轮阈值、查询间隔、本轮窗口、24H 阈值、冷却，并一键暂停/恢复，改完原地刷新、立即生效
 - Telegram 命令交互：查询、排行、订阅话题、暂停/恢复、运行时改阈值
 - `/health` 接口（Node 内置 http，零依赖），供 Railway 健康检查与保活
@@ -49,7 +49,9 @@
 | `LAUNCH_SOON_MIN` | 否 | `30` | 开盘前这么多分钟内才开始反复提醒 |
 | `LAUNCH_ALERT_INTERVAL_MIN` | 否 | `5` | 临开盘窗口内的提醒间隔（分钟） |
 | `REFRESH_INTERVAL_MIN` | 否 | `10` | 自动同步监控列表的间隔（分钟），0=关闭 |
-| `DIGEST_INTERVAL_MIN` | 否 | `60` | 全量播报间隔（分钟），0=关闭 |
+| `DIGEST_ENABLED` | 否 | `true` | 是否每天定时全量播报（`false` 关闭） |
+| `DIGEST_HOUR_CN` | 否 | `12` | 全量播报的北京时间（小时 0-23） |
+| `DIGEST_MINUTE_CN` | 否 | `0` | 全量播报的北京时间（分钟 0-59） |
 | `TRADING_CONFIG_ID` | 否 | `1` | assets-list / arena 的交易配置 id |
 | `ASPECTA_COOKIE` | 否 | — | 若接口返回 401/403，填登录后的 Cookie |
 | `PORT` | 否 | `3000` | HTTP 端口（Railway 自动注入） |
